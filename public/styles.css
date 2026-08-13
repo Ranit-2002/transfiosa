@@ -426,15 +426,22 @@ button { font-family: inherit; }
 /* ===== Verification Code Modal ===== */
 .modal-backdrop {
   position: fixed;
-  inset: 0;
-  z-index: 100;
-  background: rgba(4, 6, 7, 0.75);
-  backdrop-filter: blur(4px);
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh; /* Handles mobile address bar expansions */
+  z-index: 99999; /* Ensure modal floats above all elements */
+  background: rgba(4, 6, 7, 0.85);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 16px;
+  overflow-y: auto;
 }
+
 .pairing-modal {
   width: 100%;
   max-width: 380px;

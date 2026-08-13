@@ -77,6 +77,9 @@
 
   // --- Network Connection Events ---
   socket.on('connect', () => {
+
+    // Add a simple log in app.js on connect to verify device IDs are unique:
+    console.log('Connected with Device ID:', deviceId, 'and Socket ID:', socket.id);
     el.netDot.classList.add('online');
     el.netDot.classList.remove('offline');
     el.netLabel.textContent = 'On network';
