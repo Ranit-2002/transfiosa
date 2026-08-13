@@ -2,12 +2,12 @@
   'use strict';
 
   // ---------- Configuration ----------
-  const CHUNK_SIZE = 64 * 1024;               // 64 KB per chunk
-  const BUFFERED_AMOUNT_LOW = 256 * 1024;     // Resume sending below 256 KB
-  const BUFFERED_AMOUNT_HIGH = 1024 * 1024;   // Pause sending above 1 MB
-  const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB maximum size limit in bytes
+  const CHUNK_SIZE = 64 * 1024;                 // 64 KB per chunk
+  const BUFFERED_AMOUNT_LOW = 256 * 1024;       // Resume sending below 256 KB
+  const BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // Pause sending above 1 MB
+  const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB maximum file size limit
   
-  // Multi-STUN config for cross-network / 5G candidate gathering
+  // Multi-STUN configuration for cross-network (Wi-Fi / Cellular) P2P candidate resolution
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -122,7 +122,7 @@
   });
 
   socket.on('peers', (list) => {
-    // Only display devices that are currently unpaired
+    // Filter and display unpaired devices
     const filtered = list.filter(p => !p.pairedWith);
     state.peers = new Map(filtered.map(p => [p.id, p]));
     if (!state.pairedPeer) {
@@ -236,7 +236,7 @@
     el.pairedDeviceName.textContent = peerName;
     el.dzSub.textContent = `Connecting P2P channel with ${peerName}…`;
 
-    // Initialize WebRTC connection with assigned initiator role
+    // Initialize WebRTC connection with explicit initiator role
     state.connection = new RTCConnWrapper(peerId, peerName, initiator);
   });
 
@@ -533,7 +533,7 @@
       }
     }
 
-    handleMessage(data) {
+    async handleMessage(data) {
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
         if (msg.kind === 'file-start') {
@@ -560,9 +560,12 @@
             type: msg.type || 'application/octet-stream',
             received: 0,
             chunks: [],
+            fileHandle: null,
+            writableStream: null,
             lastTick: performance.now(),
             lastBytes: 0,
           };
+
           addTransferRow({
             id: msg.transferId,
             dir: 'down',
@@ -571,32 +574,68 @@
             peerName: this.peerName,
             status: 'Receiving…',
           });
+
+          // Stream directly to disk for files > 100 MB on supported desktop browsers
+          if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
+            try {
+              const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
+              this.incoming.fileHandle = handle;
+              this.incoming.writableStream = await handle.createWritable();
+            } catch (err) {
+              console.warn('Disk stream picker skipped/cancelled, buffering in memory.');
+            }
+          }
         } else if (msg.kind === 'file-end' && this.incoming) {
-          const blob = new Blob(this.incoming.chunks, { type: this.incoming.type });
-          updateTransferRow(this.incoming.transferId, {
-            status: 'Received',
-            statusClass: 'status-done',
-            progress: 1,
-            metaText: fmtBytes(this.incoming.size),
-            downloadUrl: URL.createObjectURL(blob),
-            downloadName: this.incoming.name,
-          });
+          const job = this.incoming;
+          let downloadUrl = null;
+
+          if (job.writableStream) {
+            await job.writableStream.close();
+            updateTransferRow(job.transferId, {
+              status: 'Saved to Disk',
+              statusClass: 'status-done',
+              progress: 1,
+              metaText: fmtBytes(job.size),
+            });
+          } else {
+            const blob = new Blob(job.chunks, { type: job.type });
+            job.chunks = []; // Immediately free RAM
+            downloadUrl = URL.createObjectURL(blob);
+
+            updateTransferRow(job.transferId, {
+              status: 'Received',
+              statusClass: 'status-done',
+              progress: 1,
+              metaText: fmtBytes(job.size),
+              downloadUrl: downloadUrl,
+              downloadName: job.name,
+            });
+          }
+
           this.incoming = null;
         }
       } else if (this.incoming) {
-        this.incoming.chunks.push(data);
-        this.incoming.received += data.byteLength;
+        const job = this.incoming;
+
+        if (job.writableStream) {
+          job.writableStream.write(data);
+        } else {
+          job.chunks.push(data);
+        }
+
+        job.received += data.byteLength;
         const now = performance.now();
-        if (now - this.incoming.lastTick > 180) {
-          const dt = (now - this.incoming.lastTick) / 1000;
-          const speed = dt > 0 ? (this.incoming.received - this.incoming.lastBytes) / dt : 0;
-          updateTransferRow(this.incoming.transferId, {
-            progress: this.incoming.size ? this.incoming.received / this.incoming.size : 1,
+        if (now - job.lastTick > 180 || job.received === job.size) {
+          const dt = (now - job.lastTick) / 1000;
+          const speed = dt > 0 ? (job.received - job.lastBytes) / dt : 0;
+          updateTransferRow(job.transferId, {
+            progress: job.size ? job.received / job.size : 1,
             speedText: fmtSpeed(speed),
-            metaText: `${fmtBytes(this.incoming.received)} / ${fmtBytes(this.incoming.size)}`,
+            etaText: fmtEta((job.size - job.received) / (speed || 1)),
+            metaText: `${fmtBytes(job.received)} / ${fmtBytes(job.size)}`,
           });
-          this.incoming.lastTick = now;
-          this.incoming.lastBytes = this.incoming.received;
+          job.lastTick = now;
+          job.lastBytes = job.received;
         }
       }
     }
@@ -656,7 +695,22 @@
     if (patch.downloadUrl) {
       const actions = card.querySelector('.transfer-actions');
       actions.hidden = false;
-      actions.innerHTML = `<a class="transfer-btn primary" href="${patch.downloadUrl}" download="${escapeHtml(patch.downloadName)}">Save File</a>`;
+      
+      const saveBtn = document.createElement('a');
+      saveBtn.className = 'transfer-btn primary';
+      saveBtn.href = patch.downloadUrl;
+      saveBtn.download = patch.downloadName;
+      saveBtn.textContent = 'Save File';
+
+      // Revoke Object URL 10 seconds after clicking to free browser RAM
+      saveBtn.addEventListener('click', () => {
+        setTimeout(() => {
+          URL.revokeObjectURL(patch.downloadUrl);
+        }, 10000);
+      });
+
+      actions.innerHTML = '';
+      actions.appendChild(saveBtn);
     }
   }
 
@@ -667,6 +721,14 @@
     el.toastStack.appendChild(t);
     setTimeout(() => t.remove(), 4000);
   }
+
+  // ---------- Page Unload Guard ----------
+  window.addEventListener('beforeunload', (e) => {
+    if (state.connection && (state.connection.activeSend || state.connection.incoming)) {
+      e.preventDefault();
+      e.returnValue = 'A file transfer is in progress. Leaving will cancel the transfer.';
+    }
+  });
 
   // ---------- Window Resize Handler ----------
   let resizeRaf = null;
