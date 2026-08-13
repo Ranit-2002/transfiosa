@@ -1,29 +1,40 @@
 (() => {
   'use strict';
 
-  const CHUNK_SIZE = 64 * 1024;
-  const BUFFERED_AMOUNT_LOW = 1 * 1024 * 1024;
-  const BUFFERED_AMOUNT_HIGH = 4 * 1024 * 1024;
+  // ---------- Configuration ----------
+  const CHUNK_SIZE = 64 * 1024; // 64KB per WebRTC DataChannel chunk
+  const BUFFERED_AMOUNT_LOW = 1 * 1024 * 1024; // Resume sending below 1MB buffered
+  const BUFFERED_AMOUNT_HIGH = 4 * 1024 * 1024; // Pause sending above 4MB buffered
+  
+  // Multi-STUN config for cross-network / 5G candidate gathering
   const RTC_CONFIG = {
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' }
+    ]
   };
 
+  // ---------- Application State ----------
   const state = {
     selfId: null,
     selfName: '',
-    peers: new Map(),
-    activePairingId: null,
-    pairedPeer: null, // { id, name }
-    connection: null, // RTCConnWrapper for paired peer
-    transfers: new Map(),
+    peers: new Map(),        // id -> peer object
+    activePairingId: null,   // Active pairing session ID
+    pairedPeer: null,        // { id, name } once successfully paired
+    connection: null,        // Active RTCConnWrapper instance
+    transfers: new Map(),    // transferId -> transfer metadata
   };
 
+  // ---------- Persistent Device Identity ----------
   let deviceId = localStorage.getItem('beam_device_id');
   if (!deviceId) {
     deviceId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     localStorage.setItem('beam_device_id', deviceId);
   }
 
+  // Connect to signaling backend with unique device persistent ID
   const socket = io('https://transfiosa-backend.onrender.com', { 
     query: { 
       name: localStorage.getItem('beam_name') || '',
@@ -31,7 +42,7 @@
     } 
   });
 
-  // DOM Elements
+  // ---------- DOM Element References ----------
   const el = {
     netDot: document.getElementById('netDot'),
     netLabel: document.getElementById('netLabel'),
@@ -59,31 +70,43 @@
     toastStack: document.getElementById('toastStack'),
   };
 
+  // ---------- Formatting & Helper Utilities ----------
   function fmtBytes(n) {
     if (n === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
     const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
     return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
   }
-  function fmtSpeed(b) { return b <= 0 ? '—' : fmtBytes(b) + '/s'; }
-  function fmtEta(s) { return (!isFinite(s) || s <= 0) ? '—' : `${Math.ceil(s)}s left`; }
-  function initials(name) { return name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(); }
-  function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+  function fmtSpeed(bytesPerSec) {
+    if (!bytesPerSec || bytesPerSec <= 0) return '—';
+    return fmtBytes(bytesPerSec) + '/s';
+  }
+  function fmtEta(seconds) {
+    if (!isFinite(seconds) || seconds <= 0) return '—';
+    if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+    const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
+    return `${m}m ${s}s left`;
+  }
+  function initials(name) {
+    return name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
+  }
+  function uid() {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
   function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
   }
 
-  // --- Network Connection Events ---
+  // ---------- Socket Network Events ----------
   socket.on('connect', () => {
-
-    // Add a simple log in app.js on connect to verify device IDs are unique:
     console.log('Connected with Device ID:', deviceId, 'and Socket ID:', socket.id);
     el.netDot.classList.add('online');
     el.netDot.classList.remove('offline');
     el.netLabel.textContent = 'On network';
   });
+
   socket.on('disconnect', () => {
     el.netDot.classList.remove('online');
     el.netDot.classList.add('offline');
@@ -98,7 +121,7 @@
   });
 
   socket.on('peers', (list) => {
-    // Only keep unpaired devices in discovery list
+    // Only display devices that are currently unpaired
     const filtered = list.filter(p => !p.pairedWith);
     state.peers = new Map(filtered.map(p => [p.id, p]));
     if (!state.pairedPeer) {
@@ -106,7 +129,7 @@
     }
   });
 
-  // --- Rename Device ---
+  // ---------- Device Rename Listener ----------
   el.renameBtn.addEventListener('click', () => {
     const next = prompt('Name this device', state.selfName);
     if (next && next.trim()) {
@@ -116,7 +139,7 @@
     }
   });
 
-  // --- Render Discovered Devices ---
+  // ---------- Render Device Discovery (List + Radar) ----------
   function renderPeers() {
     const list = [...state.peers.values()];
 
@@ -162,13 +185,12 @@
       : 'Searching network for available devices…';
   }
 
-  // --- PAIRING WORKFLOW ---
-
+  // ---------- Pairing Workflow & Modal Events ----------
   function initiatePairing(peerId) {
     socket.emit('request-pair', { targetId: peerId });
   }
 
-  // Receive Pairing Verification Request (Same code shown on both devices)
+  // Receive Verification Code Popup (Identical on both devices)
   socket.on('pair-verify', ({ pairingId, peerName, code }) => {
     state.activePairingId = pairingId;
     el.pairPeerName.textContent = peerName;
@@ -176,7 +198,7 @@
     el.pairingModalBackdrop.hidden = false;
   });
 
-  // Cancel Pairing
+  // Handle Cancel Button Click
   el.pairCancelBtn.addEventListener('click', () => {
     if (state.activePairingId) {
       socket.emit('pair-response', { pairingId: state.activePairingId, action: 'cancel' });
@@ -184,7 +206,7 @@
     closePairingModal();
   });
 
-  // Confirm Pairing
+  // Handle Confirm "Pair" Button Click
   el.pairConfirmBtn.addEventListener('click', () => {
     if (state.activePairingId) {
       el.pairConfirmBtn.disabled = true;
@@ -203,19 +225,18 @@
     pushToast({ text: message });
   });
 
-  // Pairing Confirmed -> Hide other devices, lock to exclusive connection
-  socket.on('pair-success', ({ peerId, peerName }) => {
+  // Successful Pairing Event (Hides discovery section & initiates explicit WebRTC roles)
+  socket.on('pair-success', ({ peerId, peerName, initiator }) => {
     closePairingModal();
     state.pairedPeer = { id: peerId, name: peerName };
 
-    // Hide Discovery Phase, Show Paired View
     el.discoverySection.hidden = true;
     el.pairedSection.hidden = false;
     el.pairedDeviceName.textContent = peerName;
-    el.dzSub.textContent = `Ready to send files exclusively to ${peerName}`;
+    el.dzSub.textContent = `Connecting P2P channel with ${peerName}…`;
 
-    // Establish WebRTC Data Connection
-    state.connection = new RTCConnWrapper(peerId, peerName, true);
+    // Initialize WebRTC connection with assigned initiator role
+    state.connection = new RTCConnWrapper(peerId, peerName, initiator);
   });
 
   function closePairingModal() {
@@ -225,7 +246,7 @@
     state.activePairingId = null;
   }
 
-  // --- UNPAIR / DISCONNECT WORKFLOW ---
+  // ---------- Unpair / Connection Disconnection ----------
   el.unpairBtn.addEventListener('click', () => {
     socket.emit('unpair');
   });
@@ -247,7 +268,7 @@
     renderPeers();
   }
 
-  // --- FILE TRANSFER WORKFLOW ---
+  // ---------- File Dropzone & Selection Handling ----------
   el.dropzone.addEventListener('click', () => {
     if (!state.pairedPeer) {
       pushToast({ text: 'Please select and pair with a device first.' });
@@ -285,17 +306,21 @@
     state.connection.enqueueBatch([...fileList]);
   }
 
-  // --- WEBRTC CONNECTION WRAPPER ---
+  // ============================================================
+  // WebRTC Peer-to-Peer Data Channel Wrapper
+  // ============================================================
   class RTCConnWrapper {
     constructor(peerId, peerName, initiator) {
       this.peerId = peerId;
       this.peerName = peerName;
+      this.initiator = initiator;
       this.pc = new RTCPeerConnection(RTC_CONFIG);
       this.channel = null;
       this.sendQueue = [];
       this.activeSend = null;
       this.incoming = null;
 
+      // ICE Candidate Gathering
       this.pc.onicecandidate = (e) => {
         if (e.candidate) {
           socket.emit('signal', { to: peerId, data: { type: 'ice', candidate: e.candidate } });
@@ -303,14 +328,20 @@
       };
 
       if (initiator) {
+        // Initiator creates DataChannel and sends offer
         this.channel = this.pc.createDataChannel('files', { ordered: true });
         this.setupChannel();
         this.pc.onnegotiationneeded = async () => {
-          const offer = await this.pc.createOffer();
-          await this.pc.setLocalDescription(offer);
-          socket.emit('signal', { to: peerId, data: { type: 'offer', sdp: this.pc.localDescription } });
+          try {
+            const offer = await this.pc.createOffer();
+            await this.pc.setLocalDescription(offer);
+            socket.emit('signal', { to: peerId, data: { type: 'offer', sdp: this.pc.localDescription } });
+          } catch (err) {
+            console.error('Failed to create offer:', err);
+          }
         };
       } else {
+        // Recipient listens for incoming DataChannel
         this.pc.ondatachannel = (e) => {
           this.channel = e.channel;
           this.setupChannel();
@@ -321,9 +352,30 @@
     setupChannel() {
       this.channel.binaryType = 'arraybuffer';
       this.channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW;
-      this.channel.onopen = () => this.pumpSendQueue();
+
+      this.channel.onopen = () => {
+        console.log('P2P DataChannel successfully OPEN');
+        if (el.dzSub) el.dzSub.textContent = `Ready to send files exclusively to ${this.peerName}`;
+        this.pumpSendQueue();
+      };
+
       this.channel.onmessage = (e) => this.handleMessage(e.data);
       this.channel.onbufferedamountlow = () => this.pumpActiveSend();
+      this.channel.onclose = () => this.handleChannelClosed();
+      this.channel.onerror = (err) => {
+        console.error('DataChannel error:', err);
+        this.handleChannelClosed();
+      };
+    }
+
+    handleChannelClosed() {
+      if (el.dzSub) el.dzSub.textContent = `P2P Connection lost with ${this.peerName}`;
+      if (this.activeSend) {
+        updateTransferRow(this.activeSend.transferId, {
+          status: 'Connection lost', statusClass: 'status-error'
+        });
+        this.activeSend = null;
+      }
     }
 
     async handleSignal(data) {
@@ -334,8 +386,8 @@
         socket.emit('signal', { to: this.peerId, data: { type: 'answer', sdp: this.pc.localDescription } });
       } else if (data.type === 'answer') {
         await this.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      } else if (data.type === 'ice') {
-        try { await this.pc.addIceCandidate(data.candidate); } catch (_) {}
+      } else if (data.type === 'ice' && data.candidate) {
+        try { await this.pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (_) {}
       }
     }
 
@@ -344,10 +396,13 @@
       try { this.pc.close(); } catch (_) {}
     }
 
+    // Queue outgoing files for transmission
     enqueueBatch(files) {
       const batchId = uid();
       const jobs = files.map(file => ({ transferId: uid(), batchId, file, offset: 0 }));
       this.sendQueue.push(...jobs);
+
+      const isChannelOpen = this.channel && this.channel.readyState === 'open';
 
       jobs.forEach(job => {
         addTransferRow({
@@ -356,11 +411,13 @@
           name: job.file.name,
           size: job.file.size,
           peerName: this.peerName,
-          status: 'Sending…',
+          status: isChannelOpen ? 'Sending…' : 'Connecting P2P channel…',
         });
       });
 
-      this.pumpSendQueue();
+      if (isChannelOpen) {
+        this.pumpSendQueue();
+      }
     }
 
     pumpSendQueue() {
@@ -376,6 +433,8 @@
       job.lastTick = job.startTime;
       job.lastBytes = 0;
 
+      updateTransferRow(job.transferId, { status: 'Sending…' });
+
       this.send(JSON.stringify({
         kind: 'file-start',
         transferId: job.transferId,
@@ -390,7 +449,7 @@
 
     async pumpActiveSend() {
       const job = this.activeSend;
-      if (!job || this.channel.readyState !== 'open') return;
+      if (!job || !this.channel || this.channel.readyState !== 'open') return;
 
       while (this.channel.bufferedAmount < BUFFERED_AMOUNT_HIGH) {
         const result = await job.reader.read();
@@ -431,7 +490,9 @@
     }
 
     send(data) {
-      if (this.channel && this.channel.readyState === 'open') this.channel.send(data);
+      if (this.channel && this.channel.readyState === 'open') {
+        this.channel.send(data);
+      }
     }
 
     handleMessage(data) {
@@ -487,18 +548,17 @@
     }
   }
 
-  // --- Signal Relay Handler ---
+  // ---------- WebRTC Signal Router Listener ----------
   socket.on('signal', ({ from, name, data }) => {
-    // Re-instantiate incoming connection if paired device initiates signal
-    if (!state.connection && state.pairedPeer && state.pairedPeer.id === from) {
-      state.connection = new RTCConnWrapper(from, name || state.pairedPeer.name, false);
-    }
-    if (state.connection && state.pairedPeer?.id === from) {
+    if (state.pairedPeer && state.pairedPeer.id === from) {
+      if (!state.connection) {
+        state.connection = new RTCConnWrapper(from, name || state.pairedPeer.name, false);
+      }
       state.connection.handleSignal(data);
     }
   });
 
-  // --- Transfer UI Helpers ---
+  // ---------- UI Component Helpers ----------
   function addTransferRow({ id, dir, name, size, peerName, status }) {
     el.transfersZone.hidden = false;
     const card = document.createElement('div');
@@ -507,7 +567,7 @@
     card.innerHTML = `
       <div class="transfer-top">
         <div class="transfer-meta">
-          <span class="transfer-name">${escapeHtml(name)}</span>
+          <span class="transfer-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
           <span class="transfer-peer">${dir === 'up' ? 'To' : 'From'} ${escapeHtml(peerName)}</span>
         </div>
         <span class="transfer-status">${escapeHtml(status)}</span>
@@ -521,12 +581,13 @@
       <div class="transfer-actions" hidden></div>
     `;
     el.transfersList.prepend(card);
+    state.transfers.set(id, { size });
   }
 
   function updateTransferRow(id, patch) {
     const card = el.transfersList.querySelector(`.transfer-card[data-id="${id}"]`);
     if (!card) return;
-    if (patch.status) {
+    if (patch.status !== undefined) {
       const statusEl = card.querySelector('.transfer-status');
       statusEl.textContent = patch.status;
       if (patch.statusClass) statusEl.className = `transfer-status ${patch.statusClass}`;
@@ -534,9 +595,10 @@
     if (patch.progress !== undefined) {
       card.querySelector('.transfer-bar-fill').style.width = `${Math.min(100, Math.round(patch.progress * 100))}%`;
     }
-    if (patch.metaText) card.querySelector('.stat-meta').textContent = patch.metaText;
-    if (patch.speedText) card.querySelector('.stat-speed').textContent = patch.speedText;
-    if (patch.etaText) card.querySelector('.stat-eta').textContent = patch.etaText;
+    if (patch.metaText !== undefined) card.querySelector('.stat-meta').textContent = patch.metaText;
+    if (patch.speedText !== undefined) card.querySelector('.stat-speed').textContent = patch.speedText;
+    if (patch.etaText !== undefined) card.querySelector('.stat-eta').textContent = patch.etaText;
+
     if (patch.downloadUrl) {
       const actions = card.querySelector('.transfer-actions');
       actions.hidden = false;
@@ -551,5 +613,14 @@
     el.toastStack.appendChild(t);
     setTimeout(() => t.remove(), 4000);
   }
+
+  // ---------- Window Resize Handler ----------
+  let resizeRaf = null;
+  window.addEventListener('resize', () => {
+    if (resizeRaf) cancelAnimationFrame(resizeRaf);
+    resizeRaf = requestAnimationFrame(() => {
+      if (!state.pairedPeer) renderPeers();
+    });
+  });
 
 })();
