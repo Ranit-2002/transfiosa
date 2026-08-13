@@ -24,7 +24,21 @@
     transfers: new Map(),   // transferId -> transfer record (for UI)
   };
 
-  const socket = io('https://transfiosa-backend.onrender.com', { query: { name: localStorage.getItem('beam_name') || '' } });
+  // --- NEW: Persistent Device ID ---
+  let deviceId = localStorage.getItem('beam_device_id');
+  if (!deviceId) {
+    // Generate a random ID if this is the device's first time visiting
+    deviceId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem('beam_device_id', deviceId);
+  }
+
+  // Pass the deviceId to the backend
+  const socket = io('https://transfiosa-backend.onrender.com', { 
+    query: { 
+      name: localStorage.getItem('beam_name') || '',
+      deviceId: deviceId
+    } 
+  });
 
   if (typeof RTCPeerConnection === 'undefined') {
     document.addEventListener('DOMContentLoaded', () => {
