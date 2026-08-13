@@ -3,8 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Beam — local file transfer</title>
-<meta name="description" content="Send files directly between devices on the same Wi-Fi. No cloud, no accounts.">
+<title>Beam — Direct Device File Transfer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -29,6 +28,7 @@
 
 <main class="stage">
 
+  <!-- Self Identity -->
   <section class="identity-row" aria-label="Your device">
     <div class="self-card">
       <span class="self-dot" aria-hidden="true"></span>
@@ -42,42 +42,58 @@
     </div>
   </section>
 
-  <section class="radar-zone" aria-label="Devices on your network">
-    <div class="radar" id="radar">
-      <div class="radar-ring ring-1"></div>
-      <div class="radar-ring ring-2"></div>
-      <div class="radar-ring ring-3"></div>
-      <div class="radar-sweep" id="radarSweep" aria-hidden="true"></div>
-      <div class="radar-center" id="radarCenter">
-        <span class="radar-center-dot"></span>
+  <!-- Device Discovery Phase (Radar & Discovery List) -->
+  <div id="discoverySection">
+    <section class="radar-zone" aria-label="Devices on your network">
+      <div class="radar" id="radar">
+        <div class="radar-ring ring-1"></div>
+        <div class="radar-ring ring-2"></div>
+        <div class="radar-ring ring-3"></div>
+        <div class="radar-sweep" id="radarSweep" aria-hidden="true"></div>
+        <div class="radar-center" id="radarCenter">
+          <span class="radar-center-dot"></span>
+        </div>
       </div>
-      <!-- peer nodes injected here -->
+      <p class="radar-caption" id="radarCaption">Searching your network for available devices…</p>
+    </section>
+
+    <section class="peers-zone" aria-label="Available devices">
+      <div class="peers-head">
+        <h2>Discovered Devices</h2>
+        <span class="peer-count" id="peerCount">0 found</span>
+      </div>
+      <div class="peers-list" id="peersList">
+        <div class="peers-empty" id="peersEmpty">
+          <p>No available devices found. Open Beam on another device on the same local network.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Active Paired Device Interface (Hides other devices when active) -->
+  <section id="pairedSection" class="paired-card-zone" hidden>
+    <h2>Active Connection</h2>
+    <div class="paired-card">
+      <div class="paired-info">
+        <span class="paired-badge">PAIRED</span>
+        <span class="paired-name" id="pairedDeviceName">Device Name</span>
+        <span class="paired-sub">Exclusive P2P connection active</span>
+      </div>
+      <button class="unpair-btn" id="unpairBtn">End Pairing</button>
     </div>
-    <p class="radar-caption" id="radarCaption">Searching your Wi-Fi network for other devices…</p>
   </section>
 
-  <section class="peers-zone" aria-label="Available devices">
-    <div class="peers-head">
-      <h2>Nearby devices</h2>
-      <span class="peer-count" id="peerCount">0 found</span>
-    </div>
-    <div class="peers-list" id="peersList">
-      <div class="peers-empty" id="peersEmpty">
-        <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M12 7 v6 M12 16.5 v.01" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        <p>No devices yet. Open Beam on another device connected to the <strong>same Wi-Fi</strong>.</p>
-      </div>
-    </div>
-  </section>
-
+  <!-- File Transfer Dropzone -->
   <section class="dropzone-zone">
     <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Choose files to send">
       <input type="file" id="fileInput" multiple hidden>
       <svg viewBox="0 0 24 24" width="26" height="26" class="dz-icon"><path d="M12 15 V4 M12 4 L7.5 8.5 M12 4 L16.5 8.5" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15 v3.5 a1.5 1.5 0 0 0 1.5 1.5 h13 a1.5 1.5 0 0 0 1.5 -1.5 V15" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <p class="dz-title">Drop files, or click to choose</p>
-      <p class="dz-sub" id="dzSub">Select a device above, then add files to send</p>
+      <p class="dz-sub" id="dzSub">Pair with a device above to begin file transfer</p>
     </div>
   </section>
 
+  <!-- Transfers List -->
   <section class="transfers-zone" id="transfersZone" hidden>
     <h2>Transfers</h2>
     <div class="transfers-list" id="transfersList"></div>
@@ -85,18 +101,19 @@
 
 </main>
 
-<!-- Device picker sheet -->
-<div class="sheet-backdrop" id="sheetBackdrop" hidden>
-  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
-    <div class="sheet-handle" aria-hidden="true"></div>
-    <h3 id="sheetTitle">Send to which device?</h3>
-    <p class="sheet-sub" id="sheetSub">—</p>
-    <div class="sheet-list" id="sheetList"></div>
-    <button class="sheet-cancel" id="sheetCancel">Cancel</button>
+<!-- Pairing Verification Modal -->
+<div class="modal-backdrop" id="pairingModalBackdrop" hidden>
+  <div class="pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairModalTitle">
+    <h3 id="pairModalTitle">Pairing Request</h3>
+    <p class="modal-sub">Verify that this code matches the code on <strong id="pairPeerName">Device</strong>:</p>
+    <div class="verify-code-box" id="verifyCodeDisplay">------</div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" id="pairCancelBtn">Cancel</button>
+      <button class="modal-btn confirm" id="pairConfirmBtn">Pair</button>
+    </div>
   </div>
 </div>
 
-<!-- Incoming transfer request -->
 <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
