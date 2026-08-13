@@ -7,7 +7,6 @@
   const BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // Pause sending above 1 MB
   const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB maximum file size limit
   
-  // Multi-STUN configuration for cross-network (Wi-Fi / Cellular) P2P candidate resolution
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -21,21 +20,19 @@
   const state = {
     selfId: null,
     selfName: '',
-    peers: new Map(),        // id -> peer object
-    activePairingId: null,   // Active pairing session ID
-    pairedPeer: null,        // { id, name } once successfully paired
-    connection: null,        // Active RTCConnWrapper instance
-    transfers: new Map(),    // transferId -> transfer metadata
+    peers: new Map(),        
+    activePairingId: null,   
+    pairedPeer: null,        
+    connection: null,        
+    transfers: new Map(),    
   };
 
-  // ---------- Persistent Device Identity ----------
   let deviceId = localStorage.getItem('beam_device_id');
   if (!deviceId) {
     deviceId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     localStorage.setItem('beam_device_id', deviceId);
   }
 
-  // Connect to signaling backend with unique device persistent ID
   const socket = io('https://transfiosa-backend.onrender.com', { 
     query: { 
       name: localStorage.getItem('beam_name') || '',
@@ -71,7 +68,6 @@
     toastStack: document.getElementById('toastStack'),
   };
 
-  // ---------- Formatting & Helper Utilities ----------
   function fmtBytes(n) {
     if (n === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
@@ -122,7 +118,6 @@
   });
 
   socket.on('peers', (list) => {
-    // Filter and display unpaired devices
     const filtered = list.filter(p => !p.pairedWith);
     state.peers = new Map(filtered.map(p => [p.id, p]));
     if (!state.pairedPeer) {
@@ -130,7 +125,6 @@
     }
   });
 
-  // ---------- Device Rename Listener ----------
   el.renameBtn.addEventListener('click', () => {
     const next = prompt('Name this device', state.selfName);
     if (next && next.trim()) {
@@ -140,7 +134,7 @@
     }
   });
 
-  // ---------- Render Device Discovery (List + Radar) ----------
+  // ---------- Render Device Discovery ----------
   function renderPeers() {
     const list = [...state.peers.values()];
 
@@ -186,12 +180,11 @@
       : 'Searching network for available devices…';
   }
 
-  // ---------- Pairing Workflow & Modal Events ----------
+  // ---------- Pairing Workflow ----------
   function initiatePairing(peerId) {
     socket.emit('request-pair', { targetId: peerId });
   }
 
-  // Receive Verification Code Popup
   socket.on('pair-verify', ({ pairingId, peerName, code }) => {
     state.activePairingId = pairingId;
     el.pairPeerName.textContent = peerName;
@@ -199,7 +192,6 @@
     el.pairingModalBackdrop.hidden = false;
   });
 
-  // Handle Cancel Button Click
   el.pairCancelBtn.addEventListener('click', () => {
     if (state.activePairingId) {
       socket.emit('pair-response', { pairingId: state.activePairingId, action: 'cancel' });
@@ -207,7 +199,6 @@
     closePairingModal();
   });
 
-  // Handle Confirm "Pair" Button Click
   el.pairConfirmBtn.addEventListener('click', () => {
     if (state.activePairingId) {
       el.pairConfirmBtn.disabled = true;
@@ -226,7 +217,6 @@
     pushToast({ text: message });
   });
 
-  // Successful Pairing Event
   socket.on('pair-success', ({ peerId, peerName, initiator }) => {
     closePairingModal();
     state.pairedPeer = { id: peerId, name: peerName };
@@ -236,7 +226,6 @@
     el.pairedDeviceName.textContent = peerName;
     el.dzSub.textContent = `Connecting P2P channel with ${peerName}…`;
 
-    // Initialize WebRTC connection with explicit initiator role
     state.connection = new RTCConnWrapper(peerId, peerName, initiator);
   });
 
@@ -247,7 +236,6 @@
     state.activePairingId = null;
   }
 
-  // ---------- Unpair / Connection Disconnection ----------
   el.unpairBtn.addEventListener('click', () => {
     socket.emit('unpair');
   });
@@ -269,7 +257,7 @@
     renderPeers();
   }
 
-  // ---------- File Dropzone & Selection Handling ----------
+  // ---------- File Dropzone ----------
   el.dropzone.addEventListener('click', () => {
     if (!state.pairedPeer) {
       pushToast({ text: 'Please select and pair with a device first.' });
@@ -321,7 +309,6 @@
       this.activeSend = null;
       this.incoming = null;
 
-      // ICE Candidate Gathering
       this.pc.onicecandidate = (e) => {
         if (e.candidate) {
           socket.emit('signal', { to: peerId, data: { type: 'ice', candidate: e.candidate } });
@@ -395,7 +382,6 @@
       try { this.pc.close(); } catch (_) {}
     }
 
-    // Queue outgoing files for transmission (with 5 GB size validation)
     enqueueBatch(files) {
       const oversized = files.filter(f => f.size > MAX_FILE_SIZE);
       if (oversized.length > 0) {
@@ -537,7 +523,6 @@
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
         if (msg.kind === 'file-start') {
-          // Verify incoming file size does not exceed the 5 GB maximum limit
           if (msg.size > MAX_FILE_SIZE) {
             pushToast({ text: `Rejected incoming file "${msg.name}": exceeds 5 GB limit.` });
             this.incoming = null;
@@ -559,7 +544,7 @@
             size: msg.size,
             type: msg.type || 'application/octet-stream',
             received: 0,
-            chunks: [],
+            buffer: null,
             fileHandle: null,
             writableStream: null,
             lastTick: performance.now(),
@@ -575,16 +560,31 @@
             status: 'Receiving…',
           });
 
+          let useMemoryBuffer = true;
+
           // Stream directly to disk for files > 100 MB on supported desktop browsers
           if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
             try {
               const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
               this.incoming.fileHandle = handle;
               this.incoming.writableStream = await handle.createWritable();
+              useMemoryBuffer = false; // Successfully streaming to disk
             } catch (err) {
               console.warn('Disk stream picker skipped/cancelled, buffering in memory.');
             }
           }
+
+          // Mobile device fallback: Pre-allocate contiguous memory to prevent fragmentation OOM crashes
+          if (useMemoryBuffer) {
+            try {
+              this.incoming.buffer = new Uint8Array(msg.size);
+            } catch (err) {
+              pushToast({ text: `Device memory limit exceeded. Cannot receive "${msg.name}".` });
+              this.incoming = null;
+              updateTransferRow(msg.transferId, { status: 'Device Out of Memory', statusClass: 'status-error' });
+            }
+          }
+
         } else if (msg.kind === 'file-end' && this.incoming) {
           const job = this.incoming;
           let downloadUrl = null;
@@ -597,9 +597,9 @@
               progress: 1,
               metaText: fmtBytes(job.size),
             });
-          } else {
-            const blob = new Blob(job.chunks, { type: job.type });
-            job.chunks = []; // Immediately free RAM
+          } else if (job.buffer) {
+            const blob = new Blob([job.buffer], { type: job.type });
+            job.buffer = null; // Instantly drop the huge array reference to free memory!
             downloadUrl = URL.createObjectURL(blob);
 
             updateTransferRow(job.transferId, {
@@ -619,8 +619,8 @@
 
         if (job.writableStream) {
           job.writableStream.write(data);
-        } else {
-          job.chunks.push(data);
+        } else if (job.buffer) {
+          job.buffer.set(new Uint8Array(data), job.received);
         }
 
         job.received += data.byteLength;
@@ -641,7 +641,6 @@
     }
   }
 
-  // ---------- WebRTC Signal Router Listener ----------
   socket.on('signal', ({ from, name, data }) => {
     if (state.pairedPeer && state.pairedPeer.id === from) {
       if (!state.connection) {
@@ -701,12 +700,16 @@
       saveBtn.href = patch.downloadUrl;
       saveBtn.download = patch.downloadName;
       saveBtn.textContent = 'Save File';
+      
+      // CRITICAL: Prevents iOS Safari from navigating the main frame and crashing the tab
+      saveBtn.target = '_blank';
+      saveBtn.rel = 'noopener noreferrer';
 
-      // Revoke Object URL 10 seconds after clicking to free browser RAM
+      // Revoke Object URL after a long timeout (3 minutes) to ensure mobile saving completes safely
       saveBtn.addEventListener('click', () => {
         setTimeout(() => {
           URL.revokeObjectURL(patch.downloadUrl);
-        }, 10000);
+        }, 3 * 60 * 1000); 
       });
 
       actions.innerHTML = '';
