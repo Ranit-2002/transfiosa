@@ -151,8 +151,9 @@ io.on('connection', (socket) => {
 
         socket.data.pairedWith = (socket.id === session.from) ? session.to : session.from;
 
-        io.to(session.from).emit('pair-success', { peerId: session.to, peerName: peerB?.name });
-        io.to(session.to).emit('pair-success', { peerId: session.from, peerName: peerA?.name });
+        // FIXED: Assign explicit initiator role to session.from only
+        io.to(session.from).emit('pair-success', { peerId: session.to, peerName: peerB?.name, initiator: true });
+        io.to(session.to).emit('pair-success', { peerId: session.from, peerName: peerA?.name, initiator: false });
 
         activePairings.delete(pairingId);
         broadcastRoom(room);
