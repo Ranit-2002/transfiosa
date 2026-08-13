@@ -81,21 +81,25 @@ io.on('connection', (socket) => {
 
   // --- PAIRING WORKFLOW SIGNALS ---
 
-  // Request Pairing
   socket.on('request-pair', ({ targetId }) => {
     const targetSocket = io.sockets.sockets.get(targetId);
-    if (!targetSocket) return;
-
-    // Check if target is already paired
-    const targetPeer = peers.get(targetId);
-    if (targetPeer?.pairedWith || socket.data.pairedWith) {
-      socket.emit('pair-error', { message: 'One of the devices is already paired with another device.' });
+    
+    // Return explicit error to initiator if target disconnected
+    if (!targetSocket) {
+      socket.emit('pair-error', { message: 'Device is offline or disconnected. Refreshing device list...' });
+      broadcastRoom(socket.data.room); // Refresh peer list across all clients
       return;
     }
-
+  
+    const targetPeer = peers.get(targetId);
+    if (targetPeer?.pairedWith || socket.data.pairedWith) {
+      socket.emit('pair-error', { message: 'One of the devices is already paired.' });
+      return;
+    }
+  
     const pairingId = `${socket.id}_${targetId}_${Date.now()}`;
     const code = generateVerificationCode();
-
+  
     activePairings.set(pairingId, {
       pairingId,
       from: socket.id,
@@ -103,8 +107,7 @@ io.on('connection', (socket) => {
       code,
       confirmations: new Set()
     });
-
-    // Send verification modal data to both initiator and recipient
+  
     io.to(socket.id).emit('pair-verify', {
       pairingId,
       peerId: targetId,
@@ -112,7 +115,7 @@ io.on('connection', (socket) => {
       code,
       role: 'initiator'
     });
-
+  
     io.to(targetId).emit('pair-verify', {
       pairingId,
       peerId: socket.id,
