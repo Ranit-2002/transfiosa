@@ -2,9 +2,10 @@
   'use strict';
 
   // ---------- Configuration ----------
-  const CHUNK_SIZE = 64 * 1024; // 64KB per WebRTC DataChannel chunk
-  const BUFFERED_AMOUNT_LOW = 1 * 1024 * 1024; // Resume sending below 1MB buffered
-  const BUFFERED_AMOUNT_HIGH = 4 * 1024 * 1024; // Pause sending above 4MB buffered
+  const CHUNK_SIZE = 64 * 1024;               // 64 KB per chunk
+  const BUFFERED_AMOUNT_LOW = 256 * 1024;     // Resume sending below 256 KB
+  const BUFFERED_AMOUNT_HIGH = 1024 * 1024;   // Pause sending above 1 MB
+  const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB maximum size limit in bytes
   
   // Multi-STUN config for cross-network / 5G candidate gathering
   const RTC_CONFIG = {
@@ -190,7 +191,7 @@
     socket.emit('request-pair', { targetId: peerId });
   }
 
-  // Receive Verification Code Popup (Identical on both devices)
+  // Receive Verification Code Popup
   socket.on('pair-verify', ({ pairingId, peerName, code }) => {
     state.activePairingId = pairingId;
     el.pairPeerName.textContent = peerName;
@@ -225,7 +226,7 @@
     pushToast({ text: message });
   });
 
-  // Successful Pairing Event (Hides discovery section & initiates explicit WebRTC roles)
+  // Successful Pairing Event
   socket.on('pair-success', ({ peerId, peerName, initiator }) => {
     closePairingModal();
     state.pairedPeer = { id: peerId, name: peerName };
@@ -328,7 +329,6 @@
       };
 
       if (initiator) {
-        // Initiator creates DataChannel and sends offer
         this.channel = this.pc.createDataChannel('files', { ordered: true });
         this.setupChannel();
         this.pc.onnegotiationneeded = async () => {
@@ -341,7 +341,6 @@
           }
         };
       } else {
-        // Recipient listens for incoming DataChannel
         this.pc.ondatachannel = (e) => {
           this.channel = e.channel;
           this.setupChannel();
@@ -396,10 +395,19 @@
       try { this.pc.close(); } catch (_) {}
     }
 
-    // Queue outgoing files for transmission
+    // Queue outgoing files for transmission (with 5 GB size validation)
     enqueueBatch(files) {
+      const oversized = files.filter(f => f.size > MAX_FILE_SIZE);
+      if (oversized.length > 0) {
+        const names = oversized.map(f => f.name).join(', ');
+        pushToast({ text: `File(s) exceed the 5 GB maximum limit: ${names}` });
+      }
+
+      const validFiles = files.filter(f => f.size <= MAX_FILE_SIZE);
+      if (validFiles.length === 0) return;
+
       const batchId = uid();
-      const jobs = files.map(file => ({ transferId: uid(), batchId, file, offset: 0 }));
+      const jobs = validFiles.map(file => ({ transferId: uid(), batchId, file, offset: 0 }));
       this.sendQueue.push(...jobs);
 
       const isChannelOpen = this.channel && this.channel.readyState === 'open';
@@ -432,6 +440,9 @@
       job.startTime = performance.now();
       job.lastTick = job.startTime;
       job.lastBytes = 0;
+      job.currentChunk = null;
+      job.chunkOffset = 0;
+      job.isSending = false;
 
       updateTransferRow(job.transferId, { status: 'Sending…' });
 
@@ -451,41 +462,68 @@
       const job = this.activeSend;
       if (!job || !this.channel || this.channel.readyState !== 'open') return;
 
-      while (this.channel.bufferedAmount < BUFFERED_AMOUNT_HIGH) {
-        const result = await job.reader.read();
-        if (result.done) {
-          this.send(JSON.stringify({ kind: 'file-end', transferId: job.transferId }));
-          updateTransferRow(job.transferId, {
-            status: 'Sent',
-            statusClass: 'status-done',
-            progress: 1,
-            metaText: fmtBytes(job.file.size),
-          });
-          this.activeSend = null;
-          this.pumpSendQueue();
-          return;
-        }
+      if (job.isSending) return;
+      job.isSending = true;
 
-        const chunk = result.value;
-        for (let o = 0; o < chunk.byteLength; o += CHUNK_SIZE) {
-          const piece = chunk.slice(o, Math.min(o + CHUNK_SIZE, chunk.byteLength));
-          this.channel.send(piece.buffer.byteLength === piece.byteLength ? piece.buffer : piece);
-          job.offset += piece.byteLength;
-        }
+      try {
+        while (this.channel.bufferedAmount < BUFFERED_AMOUNT_HIGH) {
+          if (!job.currentChunk) {
+            const result = await job.reader.read();
+            if (result.done) {
+              this.send(JSON.stringify({ kind: 'file-end', transferId: job.transferId }));
+              updateTransferRow(job.transferId, {
+                status: 'Sent',
+                statusClass: 'status-done',
+                progress: 1,
+                metaText: fmtBytes(job.file.size),
+              });
+              this.activeSend = null;
+              job.isSending = false;
+              this.pumpSendQueue();
+              return;
+            }
+            job.currentChunk = result.value;
+            job.chunkOffset = 0;
+          }
 
-        const now = performance.now();
-        if (now - job.lastTick > 180) {
-          const dt = (now - job.lastTick) / 1000;
-          const speed = dt > 0 ? (job.offset - job.lastBytes) / dt : 0;
-          updateTransferRow(job.transferId, {
-            progress: job.file.size ? job.offset / job.file.size : 1,
-            speedText: fmtSpeed(speed),
-            etaText: fmtEta((job.file.size - job.offset) / (speed || 1)),
-            metaText: `${fmtBytes(job.offset)} / ${fmtBytes(job.file.size)}`,
-          });
-          job.lastTick = now;
-          job.lastBytes = job.offset;
+          while (job.chunkOffset < job.currentChunk.byteLength) {
+            if (this.channel.bufferedAmount >= BUFFERED_AMOUNT_HIGH) {
+              job.isSending = false;
+              return;
+            }
+
+            const end = Math.min(job.chunkOffset + CHUNK_SIZE, job.currentChunk.byteLength);
+            const piece = job.currentChunk.subarray(job.chunkOffset, end);
+            const bufferToSend = piece.buffer.slice(piece.byteOffset, piece.byteOffset + piece.byteLength);
+            
+            this.channel.send(bufferToSend);
+
+            job.chunkOffset = end;
+            job.offset += piece.byteLength;
+          }
+
+          job.currentChunk = null;
+
+          const now = performance.now();
+          if (now - job.lastTick > 180) {
+            const dt = (now - job.lastTick) / 1000;
+            const speed = dt > 0 ? (job.offset - job.lastBytes) / dt : 0;
+            updateTransferRow(job.transferId, {
+              progress: job.file.size ? job.offset / job.file.size : 1,
+              speedText: fmtSpeed(speed),
+              etaText: fmtEta((job.file.size - job.offset) / (speed || 1)),
+              metaText: `${fmtBytes(job.offset)} / ${fmtBytes(job.file.size)}`,
+            });
+            job.lastTick = now;
+            job.lastBytes = job.offset;
+          }
         }
+      } catch (err) {
+        console.error('File send error:', err);
+        updateTransferRow(job.transferId, { status: 'Transfer error', statusClass: 'status-error' });
+        this.activeSend = null;
+      } finally {
+        job.isSending = false;
       }
     }
 
@@ -499,6 +537,22 @@
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
         if (msg.kind === 'file-start') {
+          // Verify incoming file size does not exceed the 5 GB maximum limit
+          if (msg.size > MAX_FILE_SIZE) {
+            pushToast({ text: `Rejected incoming file "${msg.name}": exceeds 5 GB limit.` });
+            this.incoming = null;
+            addTransferRow({
+              id: msg.transferId,
+              dir: 'down',
+              name: msg.name,
+              size: msg.size,
+              peerName: this.peerName,
+              status: 'Exceeds 5 GB limit',
+            });
+            updateTransferRow(msg.transferId, { statusClass: 'status-error' });
+            return;
+          }
+
           this.incoming = {
             transferId: msg.transferId,
             name: msg.name,
