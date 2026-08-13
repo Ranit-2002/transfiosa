@@ -1,0 +1,15 @@
+{
+  "name": "beam-lan-transfer",
+  "version": "1.0.0",
+  "description": "Direct device-to-device file transfer over the local Wi-Fi network. No cloud storage, no account, files never touch a server.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["file-transfer", "webrtc", "lan", "p2p"],
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  }
+}
