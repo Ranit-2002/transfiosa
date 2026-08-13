@@ -24,10 +24,7 @@
     transfers: new Map(),   // transferId -> transfer record (for UI)
   };
 
-  // Replace the URL below with the actual URL Render gave you
-  const socket = io('https://transfiosa.onrender.com', { 
-    query: { name: localStorage.getItem('beam_name') || '' } 
-  });
+  const socket = io('https://transfiosa-backend.onrender.com', { query: { name: localStorage.getItem('beam_name') || '' } });
 
   if (typeof RTCPeerConnection === 'undefined') {
     document.addEventListener('DOMContentLoaded', () => {
