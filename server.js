@@ -37,18 +37,32 @@ function randomName() {
 }
 
 io.on('connection', (socket) => {
-  // 2. Removed IP subnet logic. 
-  // Devices now join a "global" room by default, meaning users anywhere 
-  // can see each other, or you can pass a specific room code from app.js.
   const room = socket.handshake.query.room || 'global';
   const deviceName = (socket.handshake.query.name || '').toString().slice(0, 40) || randomName();
+  const deviceId = socket.handshake.query.deviceId; // Get the unique ID from frontend
 
   socket.join(room);
   socket.data.room = room;
   socket.data.name = deviceName;
+  socket.data.deviceId = deviceId;
 
   if (!rooms.has(room)) rooms.set(room, new Map());
-  rooms.get(room).set(socket.id, { name: deviceName });
+  const peers = rooms.get(room);
+
+  // --- NEW: Remove ghost/duplicate connections for this exact device ---
+  if (deviceId) {
+    for (const [existingSocketId, peer] of peers.entries()) {
+      if (peer.deviceId === deviceId && existingSocketId !== socket.id) {
+        // If we find an older connection from this exact device, delete it
+        peers.delete(existingSocketId); 
+        // Forcefully disconnect the ghost socket
+        io.sockets.sockets.get(existingSocketId)?.disconnect(true); 
+      }
+    }
+  }
+
+  // Save the fresh connection
+  peers.set(socket.id, { name: deviceName, deviceId });
 
   socket.emit('self', { id: socket.id, name: deviceName });
   broadcastRoom(room);
@@ -63,17 +77,17 @@ io.on('connection', (socket) => {
     const clean = (name || '').toString().slice(0, 40);
     if (!clean) return;
     socket.data.name = clean;
-    const peers = rooms.get(room);
-    if (peers?.has(socket.id)) peers.get(socket.id).name = clean;
+    const roomPeers = rooms.get(room);
+    if (roomPeers?.has(socket.id)) roomPeers.get(socket.id).name = clean;
     socket.emit('self', { id: socket.id, name: clean });
     broadcastRoom(room);
   });
 
   socket.on('disconnect', () => {
-    const peers = rooms.get(room);
-    if (!peers) return;
-    peers.delete(socket.id);
-    if (peers.size === 0) rooms.delete(room);
+    const roomPeers = rooms.get(room);
+    if (!roomPeers) return;
+    roomPeers.delete(socket.id);
+    if (roomPeers.size === 0) rooms.delete(room);
     else broadcastRoom(room);
   });
 });
