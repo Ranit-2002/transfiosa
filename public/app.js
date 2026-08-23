@@ -544,7 +544,7 @@
             size: msg.size,
             type: msg.type || 'application/octet-stream',
             received: 0,
-            buffer: null,
+            chunks: null,
             fileHandle: null,
             writableStream: null,
             lastTick: performance.now(),
@@ -562,7 +562,9 @@
 
           let useMemoryBuffer = true;
 
-          // Stream directly to disk for files > 100 MB on supported desktop browsers
+          // Stream directly to disk for files > 100 MB on supported desktop browsers.
+          // This is the preferred path for large files — it never holds more than a
+          // few chunks in memory at once, so it scales to 5 GB without issue.
           if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
             try {
               const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
@@ -570,19 +572,28 @@
               this.incoming.writableStream = await handle.createWritable();
               useMemoryBuffer = false; // Successfully streaming to disk
             } catch (err) {
-              console.warn('Disk stream picker skipped/cancelled, buffering in memory.');
+              // Picker was cancelled/dismissed, or unavailable in this context
+              // (e.g. not a top-level secure-context tab). Surface this instead
+              // of silently falling through to an in-memory receive, since for
+              // large files that fallback is much more fragile.
+              console.warn('Disk stream picker skipped/cancelled, buffering in memory instead.', err);
+              if (msg.size > 500 * 1024 * 1024) {
+                pushToast({
+                  text: `"${msg.name}" is large (${fmtBytes(msg.size)}) and will be held in memory because the save dialog wasn't completed. This is more likely to crash the tab — consider retrying and keeping the save dialog open.`,
+                });
+              }
             }
           }
 
-          // Mobile device fallback: Pre-allocate contiguous memory to prevent fragmentation OOM crashes
+          // Fallback for browsers without showSaveFilePicker (Firefox, Safari, mobile)
+          // or when the picker above was cancelled. Instead of pre-allocating one
+          // giant contiguous Uint8Array (which is what caused crashes well under
+          // the 5 GB limit, since a single huge allocation can fail even when
+          // total available memory is sufficient), accumulate small chunks in an
+          // array and let Blob assemble them at the end. Blob does not require
+          // its input pieces to be contiguous, so this scales far better.
           if (useMemoryBuffer) {
-            try {
-              this.incoming.buffer = new Uint8Array(msg.size);
-            } catch (err) {
-              pushToast({ text: `Device memory limit exceeded. Cannot receive "${msg.name}".` });
-              this.incoming = null;
-              updateTransferRow(msg.transferId, { status: 'Device Out of Memory', statusClass: 'status-error' });
-            }
+            this.incoming.chunks = [];
           }
 
         } else if (msg.kind === 'file-end' && this.incoming) {
@@ -597,19 +608,25 @@
               progress: 1,
               metaText: fmtBytes(job.size),
             });
-          } else if (job.buffer) {
-            const blob = new Blob([job.buffer], { type: job.type });
-            job.buffer = null; // Instantly drop the huge array reference to free memory!
-            downloadUrl = URL.createObjectURL(blob);
+          } else if (job.chunks) {
+            try {
+              const blob = new Blob(job.chunks, { type: job.type });
+              job.chunks = null; // Drop the chunk references to free memory
+              downloadUrl = URL.createObjectURL(blob);
 
-            updateTransferRow(job.transferId, {
-              status: 'Received',
-              statusClass: 'status-done',
-              progress: 1,
-              metaText: fmtBytes(job.size),
-              downloadUrl: downloadUrl,
-              downloadName: job.name,
-            });
+              updateTransferRow(job.transferId, {
+                status: 'Received',
+                statusClass: 'status-done',
+                progress: 1,
+                metaText: fmtBytes(job.size),
+                downloadUrl: downloadUrl,
+                downloadName: job.name,
+              });
+            } catch (err) {
+              console.error('Failed to assemble received file:', err);
+              pushToast({ text: `Ran out of memory assembling "${job.name}". Try again and keep the save-file dialog open so it can stream to disk instead.` });
+              updateTransferRow(job.transferId, { status: 'Out of memory', statusClass: 'status-error' });
+            }
           }
 
           this.incoming = null;
@@ -619,8 +636,11 @@
 
         if (job.writableStream) {
           job.writableStream.write(data);
-        } else if (job.buffer) {
-          job.buffer.set(new Uint8Array(data), job.received);
+        } else if (job.chunks) {
+          // `data` is an ArrayBuffer per message; store a copy as Uint8Array.
+          // Each piece stays small (CHUNK_SIZE, 64 KB) — Blob assembles the
+          // full file from these later without needing one contiguous buffer.
+          job.chunks.push(new Uint8Array(data));
         }
 
         job.received += data.byteLength;
