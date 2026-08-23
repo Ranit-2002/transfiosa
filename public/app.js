@@ -104,6 +104,25 @@
 
   const HAS_INDEXEDDB = typeof indexedDB !== 'undefined';
 
+  // Service worker enables streaming large files straight from IndexedDB to
+  // disk on download, without ever holding the full file as one resident
+  // Blob in the tab. Requires a secure context (HTTPS or localhost) — same
+  // requirement as showSaveFilePicker. If registration fails (insecure
+  // context, browser doesn't support service workers at all, etc.) this
+  // stays a rejected promise and the finalization step below falls back to
+  // the old Blob-based approach, which is fine for smaller files and is the
+  // best available option when the service worker genuinely can't run.
+  const swReady = ('serviceWorker' in navigator)
+    ? navigator.serviceWorker.register('sw.js').then((reg) => {
+        console.log('Beam: service worker registered', reg.scope);
+        return navigator.serviceWorker.ready;
+      }).catch((err) => {
+        console.warn('Beam: service worker registration failed, large downloads will fall back to in-memory assembly.', err);
+        throw err;
+      })
+    : Promise.reject(new Error('Service workers not supported in this browser'));
+  swReady.catch(() => {}); // prevent an unhandled rejection warning; callers check this themselves
+
   // ---------- Application State ----------
   const state = {
     selfId: null,
@@ -724,22 +743,61 @@
                 throw new Error('One or more chunks failed to write to IndexedDB');
               }
 
-              const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
-              downloadUrl = URL.createObjectURL(blob);
-              // Clean up the chunk store now that we have the assembled Blob;
-              // don't block the UI update on this finishing.
-              ChunkStore.clearTransfer(job.transferId).catch(() => {});
+              let swAvailable = false;
+              try {
+                await swReady;
+                swAvailable = true;
+              } catch (_) {
+                swAvailable = false;
+              }
 
-              updateTransferRow(job.transferId, {
-                status: 'Received',
-                statusClass: 'status-done',
-                progress: 1,
-                metaText: fmtBytes(job.size),
-                downloadUrl: downloadUrl,
-                downloadName: job.name,
-              });
+              if (swAvailable) {
+                // Streaming path: point the save link at the service worker's
+                // route instead of building a Blob. The service worker reads
+                // chunks out of IndexedDB and streams them into the response
+                // as the browser writes the download to disk — the full file
+                // is never held as one resident object in this tab. This is
+                // what avoids the OS killing the tab once the file gets large
+                // (the actual cause of the 100%-then-refresh crash).
+                downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
+                  + `?name=${encodeURIComponent(job.name)}`
+                  + `&type=${encodeURIComponent(job.type)}`;
+                // Don't clear the chunk store yet — the service worker still
+                // needs to read from it when the user taps Save. It's cleared
+                // after a successful download instead (see downloadCleanup
+                // wiring in updateTransferRow), with a fallback timeout.
+
+                updateTransferRow(job.transferId, {
+                  status: 'Received',
+                  statusClass: 'status-done',
+                  progress: 1,
+                  metaText: fmtBytes(job.size),
+                  downloadUrl: downloadUrl,
+                  downloadName: job.name,
+                  streamingDownload: true,
+                  transferIdForCleanup: job.transferId,
+                });
+              } else {
+                // No service worker (insecure context, unsupported browser).
+                // Falling back to the previous Blob-based approach — this is
+                // the same risk profile as before for large files on mobile,
+                // but there's no safer option available without HTTPS.
+                console.warn('Service worker unavailable; falling back to in-memory Blob assembly for', job.name);
+                const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
+                downloadUrl = URL.createObjectURL(blob);
+                ChunkStore.clearTransfer(job.transferId).catch(() => {});
+
+                updateTransferRow(job.transferId, {
+                  status: 'Received',
+                  statusClass: 'status-done',
+                  progress: 1,
+                  metaText: fmtBytes(job.size),
+                  downloadUrl: downloadUrl,
+                  downloadName: job.name,
+                });
+              }
             } catch (err) {
-              console.error('Failed to assemble received file from IndexedDB:', err);
+              console.error('Failed to finalize received file from IndexedDB:', err);
               pushToast({ text: `Failed to finalize "${job.name}" after receiving. Please try again.` });
               updateTransferRow(job.transferId, { status: 'Assembly failed', statusClass: 'status-error' });
               ChunkStore.clearTransfer(job.transferId).catch(() => {});
@@ -876,17 +934,37 @@
       saveBtn.href = patch.downloadUrl;
       saveBtn.download = patch.downloadName;
       saveBtn.textContent = 'Save File';
-      
-      // CRITICAL: Prevents iOS Safari from navigating the main frame and crashing the tab
-      saveBtn.target = '_blank';
-      saveBtn.rel = 'noopener noreferrer';
 
-      // Revoke Object URL after a long timeout (3 minutes) to ensure mobile saving completes safely
-      saveBtn.addEventListener('click', () => {
-        setTimeout(() => {
-          URL.revokeObjectURL(patch.downloadUrl);
-        }, 3 * 60 * 1000); 
-      });
+      if (patch.streamingDownload) {
+        // Streaming download (service-worker route): this is a same-origin
+        // request the browser handles as a normal download, so it does not
+        // need target="_blank" or object-URL revocation. Clean up the
+        // IndexedDB chunk store once the browser has finished fetching —
+        // detected via a message the service worker could post back, but
+        // since that round-trip adds complexity for uncertain benefit here,
+        // a generous fixed delay after the click is used instead. This
+        // matches the spirit of the original 3-minute safety delay used for
+        // the object-URL case below, and errs toward keeping the data
+        // available rather than deleting it too early.
+        saveBtn.addEventListener('click', () => {
+          setTimeout(() => {
+            ChunkStore.clearTransfer(patch.transferIdForCleanup).catch(() => {});
+          }, 3 * 60 * 1000);
+        });
+      } else {
+        // Object-URL case (fallback path, or the small-file / disk-stream
+        // paths elsewhere in this file that still use it): prevents iOS
+        // Safari specifically from navigating the main frame on click.
+        saveBtn.target = '_blank';
+        saveBtn.rel = 'noopener noreferrer';
+
+        // Revoke Object URL after a long timeout (3 minutes) to ensure mobile saving completes safely
+        saveBtn.addEventListener('click', () => {
+          setTimeout(() => {
+            URL.revokeObjectURL(patch.downloadUrl);
+          }, 3 * 60 * 1000); 
+        });
+      }
 
       actions.innerHTML = '';
       actions.appendChild(saveBtn);
