@@ -16,6 +16,94 @@
     ]
   };
 
+  // ---------- IndexedDB Chunk Store ----------
+  // Backing store for incoming files on browsers without showSaveFilePicker
+  // (Firefox, Safari, and every mobile browser). Chunks are written to disk-backed
+  // IndexedDB as they arrive rather than held in a growing JS array, so the JS heap
+  // never has to hold more than one chunk at a time regardless of file size. This
+  // matters specifically on mobile, where tabs are reclaimed by the OS well before
+  // desktop-level memory limits are hit — accumulating megabytes of chunk objects
+  // in memory for the whole transfer is what was causing the mobile tab to reload
+  // near completion (when the final in-memory Blob assembly happened).
+  const ChunkStore = {
+    dbPromise: null,
+
+    _openDb() {
+      if (this.dbPromise) return this.dbPromise;
+      this.dbPromise = new Promise((resolve, reject) => {
+        const req = indexedDB.open('beam-transfer-store', 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains('chunks')) {
+            // Keyed by [transferId, chunkIndex] so chunks stay in order per transfer
+            db.createObjectStore('chunks', { keyPath: ['transferId', 'index'] });
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      return this.dbPromise;
+    },
+
+    async putChunk(transferId, index, data) {
+      const db = await this._openDb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('chunks', 'readwrite');
+        tx.objectStore('chunks').put({ transferId, index, data });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+
+    // Reads all chunks for a transfer back out in order and assembles a Blob.
+    // Reading happens one chunk at a time via a cursor, so this doesn't require
+    // holding the full chunk list in memory either — only the running Blob parts
+    // array, which holds references, not copies, until Blob construction.
+    async assembleBlob(transferId, mimeType) {
+      const db = await this._openDb();
+      const parts = [];
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('chunks', 'readonly');
+        const store = tx.objectStore('chunks');
+        const range = IDBKeyRange.bound([transferId, 0], [transferId, Infinity]);
+        const cursorReq = store.openCursor(range);
+        cursorReq.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) {
+            parts.push(cursor.value.data);
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      });
+      return new Blob(parts, { type: mimeType });
+    },
+
+    async clearTransfer(transferId) {
+      const db = await this._openDb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('chunks', 'readwrite');
+        const store = tx.objectStore('chunks');
+        const range = IDBKeyRange.bound([transferId, 0], [transferId, Infinity]);
+        const cursorReq = store.openCursor(range);
+        cursorReq.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) {
+            cursor.delete();
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      });
+    },
+  };
+
+  const HAS_INDEXEDDB = typeof indexedDB !== 'undefined';
+
   // ---------- Application State ----------
   const state = {
     selfId: null,
@@ -544,7 +632,9 @@
             size: msg.size,
             type: msg.type || 'application/octet-stream',
             received: 0,
-            chunks: null,
+            chunkIndex: 0,
+            receiveMode: null,   // 'disk' | 'indexeddb' | 'memory'
+            memoryChunks: null,  // only used for receiveMode === 'memory'
             fileHandle: null,
             writableStream: null,
             lastTick: performance.now(),
@@ -560,47 +650,62 @@
             status: 'Receiving…',
           });
 
-          let useMemoryBuffer = true;
-
-          // Stream directly to disk for files > 100 MB on supported desktop browsers.
-          // This is the preferred path for large files — it never holds more than a
-          // few chunks in memory at once, so it scales to 5 GB without issue.
+          // Preference order for where incoming bytes go, strongest guarantee first:
+          //
+          // 1. 'disk'      — File System Access API (showSaveFilePicker). Writes
+          //                  straight to the OS filesystem via the browser, no
+          //                  meaningful memory ceiling. Desktop Chrome/Edge only,
+          //                  and only when the save dialog is completed.
+          // 2. 'indexeddb' — IndexedDB-backed chunk store (see ChunkStore above).
+          //                  Persists each chunk to disk-backed storage as it
+          //                  arrives, so the JS heap never holds more than one
+          //                  chunk at a time. Supported on every mobile browser
+          //                  and every desktop browser without (1). This is the
+          //                  fix for the mobile crash: previously mobile always
+          //                  fell through to holding the whole file in a JS
+          //                  array/Blob, which is what the OS was reclaiming the
+          //                  tab over near completion.
+          // 3. 'memory'    — Last resort, only if IndexedDB itself is unavailable
+          //                  (very old/locked-down browsers, private-mode
+          //                  restrictions in some browsers). Capped separately
+          //                  below since it carries the same risk (1) and (2) do
+          //                  not.
           if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
             try {
               const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
               this.incoming.fileHandle = handle;
               this.incoming.writableStream = await handle.createWritable();
-              useMemoryBuffer = false; // Successfully streaming to disk
+              this.incoming.receiveMode = 'disk';
             } catch (err) {
               // Picker was cancelled/dismissed, or unavailable in this context
-              // (e.g. not a top-level secure-context tab). Surface this instead
-              // of silently falling through to an in-memory receive, since for
-              // large files that fallback is much more fragile.
-              console.warn('Disk stream picker skipped/cancelled, buffering in memory instead.', err);
-              if (msg.size > 500 * 1024 * 1024) {
-                pushToast({
-                  text: `"${msg.name}" is large (${fmtBytes(msg.size)}) and will be held in memory because the save dialog wasn't completed. This is more likely to crash the tab — consider retrying and keeping the save dialog open.`,
-                });
-              }
+              // (e.g. not a top-level secure-context tab, or no File System
+              // Access support at all — expected on every mobile browser).
+              console.warn('Disk stream picker skipped/cancelled/unsupported, falling back.', err);
             }
           }
 
-          // Fallback for browsers without showSaveFilePicker (Firefox, Safari, mobile)
-          // or when the picker above was cancelled. Instead of pre-allocating one
-          // giant contiguous Uint8Array (which is what caused crashes well under
-          // the 5 GB limit, since a single huge allocation can fail even when
-          // total available memory is sufficient), accumulate small chunks in an
-          // array and let Blob assemble them at the end. Blob does not require
-          // its input pieces to be contiguous, so this scales far better.
-          if (useMemoryBuffer) {
-            this.incoming.chunks = [];
+          if (!this.incoming.receiveMode) {
+            if (HAS_INDEXEDDB) {
+              this.incoming.receiveMode = 'indexeddb';
+              // Clear any stale chunks from a previous failed attempt with the
+              // same transferId before writing fresh ones.
+              try { await ChunkStore.clearTransfer(msg.transferId); } catch (_) {}
+            } else {
+              this.incoming.receiveMode = 'memory';
+              this.incoming.memoryChunks = [];
+              if (msg.size > 500 * 1024 * 1024) {
+                pushToast({
+                  text: `"${msg.name}" is large (${fmtBytes(msg.size)}) and this browser doesn't support disk streaming or IndexedDB, so it will be held in memory. This is more likely to crash the tab.`,
+                });
+              }
+            }
           }
 
         } else if (msg.kind === 'file-end' && this.incoming) {
           const job = this.incoming;
           let downloadUrl = null;
 
-          if (job.writableStream) {
+          if (job.receiveMode === 'disk') {
             await job.writableStream.close();
             updateTransferRow(job.transferId, {
               status: 'Saved to Disk',
@@ -608,10 +713,41 @@
               progress: 1,
               metaText: fmtBytes(job.size),
             });
-          } else if (job.chunks) {
+          } else if (job.receiveMode === 'indexeddb') {
             try {
-              const blob = new Blob(job.chunks, { type: job.type });
-              job.chunks = null; // Drop the chunk references to free memory
+              // Wait for every queued chunk write to actually land before
+              // reading anything back — file-end can otherwise arrive and
+              // start assembling while the last few writes are still in
+              // flight, silently producing a truncated file.
+              if (job.writeQueue) await job.writeQueue;
+              if (job.writeFailed) {
+                throw new Error('One or more chunks failed to write to IndexedDB');
+              }
+
+              const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
+              downloadUrl = URL.createObjectURL(blob);
+              // Clean up the chunk store now that we have the assembled Blob;
+              // don't block the UI update on this finishing.
+              ChunkStore.clearTransfer(job.transferId).catch(() => {});
+
+              updateTransferRow(job.transferId, {
+                status: 'Received',
+                statusClass: 'status-done',
+                progress: 1,
+                metaText: fmtBytes(job.size),
+                downloadUrl: downloadUrl,
+                downloadName: job.name,
+              });
+            } catch (err) {
+              console.error('Failed to assemble received file from IndexedDB:', err);
+              pushToast({ text: `Failed to finalize "${job.name}" after receiving. Please try again.` });
+              updateTransferRow(job.transferId, { status: 'Assembly failed', statusClass: 'status-error' });
+              ChunkStore.clearTransfer(job.transferId).catch(() => {});
+            }
+          } else if (job.receiveMode === 'memory' && job.memoryChunks) {
+            try {
+              const blob = new Blob(job.memoryChunks, { type: job.type });
+              job.memoryChunks = null;
               downloadUrl = URL.createObjectURL(blob);
 
               updateTransferRow(job.transferId, {
@@ -624,7 +760,7 @@
               });
             } catch (err) {
               console.error('Failed to assemble received file:', err);
-              pushToast({ text: `Ran out of memory assembling "${job.name}". Try again and keep the save-file dialog open so it can stream to disk instead.` });
+              pushToast({ text: `Ran out of memory assembling "${job.name}".` });
               updateTransferRow(job.transferId, { status: 'Out of memory', statusClass: 'status-error' });
             }
           }
@@ -634,13 +770,33 @@
       } else if (this.incoming) {
         const job = this.incoming;
 
-        if (job.writableStream) {
+        if (job.receiveMode === 'disk') {
           job.writableStream.write(data);
-        } else if (job.chunks) {
+        } else if (job.receiveMode === 'indexeddb') {
+          // Chunks are numbered in arrival order and written to IndexedDB. The
+          // data channel is ordered (created with `ordered: true`), so arrival
+          // order is guaranteed to match send order — chunkIndex just needs to
+          // increment monotonically here, which it does.
+          //
+          // Writes are chained onto job.writeQueue rather than awaited directly:
+          // onmessage must stay synchronous-ish so it doesn't fall behind the
+          // channel, but IndexedDB writes are async. Chaining preserves write
+          // order (each write starts only after the previous one settles) without
+          // blocking the message handler itself.
+          const index = job.chunkIndex++;
+          const dataCopy = new Uint8Array(data); // copy out before the underlying buffer is reused
+          job.writeQueue = (job.writeQueue || Promise.resolve()).then(
+            () => ChunkStore.putChunk(job.transferId, index, dataCopy)
+          ).catch((err) => {
+            console.error('Failed to write chunk to IndexedDB:', err);
+            job.writeFailed = true;
+          });
+        } else if (job.receiveMode === 'memory' && job.memoryChunks) {
           // `data` is an ArrayBuffer per message; store a copy as Uint8Array.
           // Each piece stays small (CHUNK_SIZE, 64 KB) — Blob assembles the
-          // full file from these later without needing one contiguous buffer.
-          job.chunks.push(new Uint8Array(data));
+          // full file from these later. Only reached when IndexedDB itself is
+          // unavailable, which is rare.
+          job.memoryChunks.push(new Uint8Array(data));
         }
 
         job.received += data.byteLength;
