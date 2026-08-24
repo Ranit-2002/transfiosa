@@ -130,6 +130,26 @@
     ? navigator.serviceWorker.register('sw.js').then((reg) => {
         console.log('Beam: service worker registered', reg.scope);
         return navigator.serviceWorker.ready;
+      }).then((reg) => {
+        // A worker reaching 'active' does not mean THIS page is controlled —
+        // per spec, a page is only controlled by a worker that was already
+        // active before the page loaded. On this browser's very first ever
+        // visit, that's never true yet, so navigator.serviceWorker.controller
+        // is null even though registration and activation both succeeded.
+        // The standard fix is a one-time reload right after first
+        // activation, so the *next* load is genuinely controlled. Guarded
+        // with localStorage so this can only ever happen once per browser —
+        // never on a page that already has an active pairing or transfer,
+        // where a surprise reload would tear down the live WebRTC
+        // connection.
+        const alreadyReloaded = localStorage.getItem('beam-sw-first-reload-done');
+        const hasActiveSession = !!(state.pairedPeer || state.connection);
+        if (!navigator.serviceWorker.controller && !alreadyReloaded && !hasActiveSession) {
+          localStorage.setItem('beam-sw-first-reload-done', '1');
+          console.log('Beam: reloading once so this page becomes controlled by the newly-activated service worker.');
+          window.location.reload();
+        }
+        return reg;
       }).catch((err) => {
         console.warn('Beam: service worker registration failed, large downloads will fall back to in-memory assembly.', err);
         throw err;
@@ -141,10 +161,25 @@
   // transfer out of IndexedDB and closed the response stream successfully —
   // i.e. the download genuinely completed, not just "some time has passed
   // since a click." This is what cleanup should be conditioned on.
+  //
+  // A natural extra click on "Save File" — a habit, a "did that work?"
+  // re-click, the browser's own download-manager retry affordance — is
+  // completely normal user behavior. Once cleanup below has run, though,
+  // the chunks are genuinely gone, so a second click can only ever hit
+  // ChunkStore.hasTransfer's pre-flight check and fail. Previously that
+  // failure surfaced with a message written for the "this expired from
+  // disuse, ask the sender to resend" case, which is misleading here — the
+  // file didn't expire, it was deleted moments earlier because the person
+  // successfully got it. The fix in both directions: mark the row as
+  // downloaded (disabling the button) as soon as we know cleanup is about
+  // to happen, so a second click is prevented rather than silently
+  // defeated; and make the fallback message honest for whichever case
+  // actually occurs.
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg && msg.type === 'beam-download-complete' && msg.transferId) {
+        updateTransferRow(msg.transferId, { downloadConsumed: true });
         ChunkStore.clearTransfer(msg.transferId).catch(() => {});
       }
     });
@@ -792,10 +827,28 @@
                 throw new Error('One or more chunks failed to write to IndexedDB');
               }
 
+              // swReady resolving only means the worker reached the
+              // 'active' state — it does NOT mean this specific already-open
+              // page is controlled by it. Per the service worker spec, a
+              // page only becomes controlled after the worker was active
+              // *before* that page loaded (or via clients.claim(), which
+              // this worker's activate handler calls, but that still races
+              // against exactly when activation finishes relative to when
+              // this page loaded). navigator.serviceWorker.controller is the
+              // actual documented signal for "is this page controlled right
+              // now" — checking swReady alone let this fall through on a
+              // genuine first attempt: the download URL would be constructed
+              // assuming interception, the fetch would go straight to the
+              // network with nothing there to serve /beam-download/..., and
+              // the browser would report it as unavailable — no retry or
+              // stale timer needed to reach that state.
               let swAvailable = false;
               try {
                 await swReady;
-                swAvailable = true;
+                swAvailable = !!navigator.serviceWorker.controller;
+                if (!swAvailable) {
+                  console.warn('Beam: service worker is active but not controlling this page yet (likely first load since registration). Falling back to Blob assembly for this download.');
+                }
               } catch (_) {
                 swAvailable = false;
               }
@@ -813,8 +866,9 @@
                   + `&type=${encodeURIComponent(job.type)}`;
                 // Don't clear the chunk store yet — the service worker still
                 // needs to read from it when the user taps Save. It's cleared
-                // after a successful download instead (see downloadCleanup
-                // wiring in updateTransferRow), with a fallback timeout.
+                // by the 'beam-download-complete' message listener once the
+                // service worker confirms it actually finished reading every
+                // chunk (see near the swReady declaration above).
 
                 updateTransferRow(job.transferId, {
                   status: 'Received',
@@ -974,6 +1028,27 @@
     if (patch.speedText !== undefined) card.querySelector('.stat-speed').textContent = patch.speedText;
     if (patch.etaText !== undefined) card.querySelector('.stat-eta').textContent = patch.etaText;
 
+    if (patch.downloadConsumed) {
+      // A confirmed-complete download already happened for this transfer
+      // (see the 'beam-download-complete' listener above) and its chunks
+      // have been or are about to be cleared. Replace the live Save button
+      // with a disabled, clearly-labeled one so a natural second click
+      // can't reach a fetch that's now guaranteed to fail — and so it's
+      // visually obvious why, instead of the button looking unchanged while
+      // silently broken underneath.
+      const actions = card.querySelector('.transfer-actions');
+      if (actions) {
+        actions.innerHTML = '';
+        const doneBtn = document.createElement('span');
+        doneBtn.className = 'transfer-btn primary disabled';
+        doneBtn.textContent = 'Downloaded ✓';
+        doneBtn.setAttribute('aria-disabled', 'true');
+        actions.appendChild(doneBtn);
+      }
+      const state = card._downloadState || (card._downloadState = {});
+      state.consumed = true;
+    }
+
     if (patch.downloadUrl) {
       const actions = card.querySelector('.transfer-actions');
       actions.hidden = false;
@@ -998,18 +1073,28 @@
         // site" error for a transfer that had genuinely succeeded moments
         // earlier.
         //
-        // This still leaves one legitimate case: the chunks really are gone
-        // (cleared after a prior successful download, or lost to browser
-        // storage pressure). Checking first and giving a clear in-app
-        // message beats letting that surface as the same generic
-        // browser-level download error that caused the original confusion.
+        // Two distinct legitimate cases can make chunks missing by the time
+        // of a click: (a) this same tab already confirmed a full download
+        // for this transfer — tracked via card._downloadState.consumed,
+        // set by the downloadConsumed patch handler above — in which case
+        // the honest message is "you already got this"; or (b) the data is
+        // gone for some other reason (browser storage pressure, a stale
+        // link from an earlier session) and the person may never have
+        // received it, where "ask the sender to resend" is the accurate
+        // message. Checking card._downloadState first distinguishes them
+        // instead of guessing one message for both.
         saveBtn.addEventListener('click', async (clickEvent) => {
+          if (card._downloadState && card._downloadState.consumed) {
+            clickEvent.preventDefault();
+            pushToast({ text: `You've already downloaded "${patch.downloadName}" — no need to save it again.` });
+            return;
+          }
           const exists = await ChunkStore.hasTransfer(patch.transferIdForCleanup).catch(() => true);
           // On a check failure, default to letting the download attempt
           // proceed rather than blocking a possibly-fine download.
           if (!exists) {
             clickEvent.preventDefault();
-            pushToast({ text: `"${patch.downloadName}" is no longer available to download — it was already saved and cleared. Ask the sender to send it again if you need another copy.` });
+            pushToast({ text: `"${patch.downloadName}" is no longer available to download. Ask the sender to send it again if you need a copy.` });
           }
         });
       } else {

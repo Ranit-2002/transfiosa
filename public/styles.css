@@ -269,6 +269,10 @@ button { font-family: inherit; }
 }
 .transfer-btn.primary { border-color: var(--signal-dim); color: var(--signal); }
 .transfer-btn:hover { border-color: var(--signal); }
+.transfer-btn.disabled {
+  cursor: default; opacity: 0.6; border-color: var(--border); color: var(--text-dim);
+}
+.transfer-btn.disabled:hover { border-color: var(--border); }
 
 /* ===== Device picker sheet ===== */
 .sheet-backdrop {
