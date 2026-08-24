@@ -83,51 +83,44 @@ self.addEventListener('fetch', (event) => {
     }
 
     let bytesEnqueued = 0;
+    
+    let currentIndex = 0;
+    let sawAnyChunk = false;
 
     const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          let sawAnyChunk = false;
-          await forEachChunkInOrder(db, transferId, (data) => {
-            sawAnyChunk = true;
-            bytesEnqueued += data.byteLength;
-            controller.enqueue(data);
-          });
-
-          if (!sawAnyChunk) {
-            // The chunks are gone. Distinguish this from a transient failure
-            // in the response body so the page can tell the user plainly
-            // "this needs re-sending" instead of a bare network-style error.
-            // (Previously chunks were deleted on a fixed 3-minute timer after
-            // the first click, with no confirmation the download had actually
-            // finished — a second click or retry after that window silently
-            // hit this exact case. Cleanup now happens only after a
-            // confirmed full read, via the 'beam-download-complete' message
-            // below, so a legitimate re-download attempt won't be defeated
-            // by a stale timer.)
-            controller.error(new Error('EXPIRED_OR_MISSING'));
-            return;
-          }
-
-          controller.close();
-
-          // Tell every controlled page that this transfer was fully read out
-          // of storage, so app.js can clear it now — based on a confirmed
-          // successful read, not a guess about how long that should take.
-          // includeUncontrolled: true matters here specifically — on a cold
-          // load right after this service worker first registers/activates,
-          // the page that issued this very fetch might not yet count as a
-          // "controlled" client in the strict sense, and would otherwise be
-          // silently excluded from this list, never receiving the completion
-          // message the app depends on for cleanup timing.
-          const clients = await self.clients.matchAll({ includeUncontrolled: true });
-          for (const client of clients) {
-            client.postMessage({ type: 'beam-download-complete', transferId, bytesEnqueued });
-          }
-        } catch (err) {
-          controller.error(err);
-        }
-      },
+      async pull(controller) {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_NAME, 'readonly');
+          const store = tx.objectStore(STORE_NAME);
+          const req = store.get([transferId, currentIndex]);
+          
+          req.onsuccess = async (e) => {
+            const record = e.target.result;
+            if (record) {
+              sawAnyChunk = true;
+              controller.enqueue(record.data);
+              bytesEnqueued += record.data.byteLength;
+              currentIndex++;
+              resolve();
+            } else {
+              if (!sawAnyChunk && currentIndex === 0) {
+                controller.error(new Error('EXPIRED_OR_MISSING'));
+                return resolve();
+              }
+              
+              controller.close();
+              
+              // Only trigger cleanup when the browser has genuinely consumed the last chunk
+              const clients = await self.clients.matchAll({ includeUncontrolled: true });
+              for (const client of clients) {
+                client.postMessage({ type: 'beam-download-complete', transferId, bytesEnqueued });
+              }
+              resolve();
+            }
+          };
+          req.onerror = () => reject(req.error);
+        });
+      }
     });
 
     const headers = new Headers({
