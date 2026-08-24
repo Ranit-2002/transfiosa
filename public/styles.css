@@ -508,3 +508,27 @@ button { font-family: inherit; }
 .modal-btn.confirm:hover {
   filter: brightness(1.1);
 }
+
+.incoming-file-info {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg);
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--signal-dim);
+  margin: 6px 0 12px;
+  width: 100%;
+}
+.incoming-file-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text);
+  word-break: break-all;
+}
+.incoming-file-size {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--signal);
+}

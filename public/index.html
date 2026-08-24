@@ -116,6 +116,22 @@
 
 <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
+<!-- Incoming Transfer Confirmation Modal -->
+<div class="modal-backdrop" id="incomingModalBackdrop" hidden>
+  <div class="pairing-modal" role="dialog" aria-modal="true" aria-labelledby="incomingModalTitle">
+    <h3 id="incomingModalTitle">Incoming File</h3>
+    <p class="modal-sub"><strong id="incomingSenderName">Peer</strong> wants to send you:</p>
+    <div class="incoming-file-info">
+      <span class="incoming-file-name" id="incomingFileName">file.zip</span>
+      <span class="incoming-file-size" id="incomingFileSize">0 B</span>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" id="incomingDeclineBtn">Decline</button>
+      <button class="modal-btn confirm" id="incomingAcceptBtn">Accept & Save</button>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
 <script src="app.js"></script>
 </body>

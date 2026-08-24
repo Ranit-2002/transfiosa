@@ -5,7 +5,7 @@
   const CHUNK_SIZE = 64 * 1024;                 // 64 KB per chunk
   const BUFFERED_AMOUNT_LOW = 256 * 1024;       // Resume sending below 256 KB
   const BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // Pause sending above 1 MB
-  const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB maximum file size limit
+  const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB limit
   
   const RTC_CONFIG = {
     iceServers: [
@@ -105,22 +105,12 @@
 
   const swReady = ('serviceWorker' in navigator)
     ? navigator.serviceWorker.register('sw.js').then((reg) => {
-        console.log('Beam: service worker registered', reg.scope);
         return navigator.serviceWorker.ready;
-      }).then((reg) => {
-        const alreadyReloaded = localStorage.getItem('beam-sw-first-reload-done');
-        const hasActiveSession = !!(state.pairedPeer || state.connection);
-        if (!navigator.serviceWorker.controller && !alreadyReloaded && !hasActiveSession) {
-          localStorage.setItem('beam-sw-first-reload-done', '1');
-          console.log('Beam: reloading once so this page becomes controlled by the newly-activated service worker.');
-          window.location.reload();
-        }
-        return reg;
       }).catch((err) => {
-        console.warn('Beam: service worker registration failed, large downloads will fall back to in-memory assembly.', err);
+        console.warn('Beam: service worker registration failed.', err);
         throw err;
       })
-    : Promise.reject(new Error('Service workers not supported in this browser'));
+    : Promise.reject(new Error('Service workers not supported'));
   swReady.catch(() => {}); 
 
   if ('serviceWorker' in navigator) {
@@ -141,7 +131,8 @@
     activePairingId: null,   
     pairedPeer: null,        
     connection: null,        
-    transfers: new Map(),    
+    transfers: new Map(),
+    pendingIncomingOffer: null,    
   };
 
   let deviceId = localStorage.getItem('beam_device_id');
@@ -182,11 +173,17 @@
     verifyCodeDisplay: document.getElementById('verifyCodeDisplay'),
     pairCancelBtn: document.getElementById('pairCancelBtn'),
     pairConfirmBtn: document.getElementById('pairConfirmBtn'),
+    incomingModalBackdrop: document.getElementById('incomingModalBackdrop'),
+    incomingSenderName: document.getElementById('incomingSenderName'),
+    incomingFileName: document.getElementById('incomingFileName'),
+    incomingFileSize: document.getElementById('incomingFileSize'),
+    incomingDeclineBtn: document.getElementById('incomingDeclineBtn'),
+    incomingAcceptBtn: document.getElementById('incomingAcceptBtn'),
     toastStack: document.getElementById('toastStack'),
   };
 
   function fmtBytes(n) {
-    if (n === 0) return '0 B';
+    if (!n || n === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
     const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
     return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
@@ -215,7 +212,6 @@
 
   // ---------- Socket Network Events ----------
   socket.on('connect', () => {
-    console.log('Connected with Device ID:', deviceId, 'and Socket ID:', socket.id);
     el.netDot.classList.add('online');
     el.netDot.classList.remove('offline');
     el.netLabel.textContent = 'On network';
@@ -271,8 +267,7 @@
         </div>
         <button class="connect-action-btn">Connect</button>
       `;
-      const trigger = () => initiatePairing(peer.id);
-      row.addEventListener('click', trigger);
+      row.addEventListener('click', () => initiatePairing(peer.id));
       el.peersList.appendChild(row);
     });
 
@@ -374,6 +369,42 @@
     renderPeers();
   }
 
+  // ---------- Incoming Transfer Acceptance Handlers ----------
+  el.incomingAcceptBtn.addEventListener('click', async () => {
+    const offer = state.pendingIncomingOffer;
+    if (!offer || !state.connection) return;
+
+    el.incomingModalBackdrop.hidden = true;
+    state.pendingIncomingOffer = null;
+
+    let receiveMode = 'indexeddb';
+    let fileHandle = null;
+    let writableStream = null;
+
+    // Check if Direct-to-Disk is supported (Desktop Chrome / Edge / Opera)
+    if ('showSaveFilePicker' in window) {
+      try {
+        fileHandle = await window.showSaveFilePicker({ suggestedName: offer.name });
+        writableStream = await fileHandle.createWritable();
+        receiveMode = 'disk';
+      } catch (err) {
+        console.warn('File picker cancelled or failed, falling back to IndexedDB/SW.', err);
+        receiveMode = 'indexeddb';
+      }
+    }
+
+    state.connection.acceptIncomingOffer(offer, receiveMode, fileHandle, writableStream);
+  });
+
+  el.incomingDeclineBtn.addEventListener('click', () => {
+    const offer = state.pendingIncomingOffer;
+    if (offer && state.connection) {
+      state.connection.declineIncomingOffer(offer.transferId);
+    }
+    el.incomingModalBackdrop.hidden = true;
+    state.pendingIncomingOffer = null;
+  });
+
   // ---------- File Dropzone ----------
   el.dropzone.addEventListener('click', () => {
     if (!state.pairedPeer) {
@@ -457,7 +488,6 @@
       this.channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW;
 
       this.channel.onopen = () => {
-        console.log('P2P DataChannel successfully OPEN');
         if (el.dzSub) el.dzSub.textContent = `Ready to send files exclusively to ${this.peerName}`;
         this.pumpSendQueue();
       };
@@ -467,23 +497,17 @@
       this.channel.onclose = () => this.handleChannelClosed('channel closed');
       this.channel.onerror = (err) => {
         const detail = err?.error ? `${err.error.errorDetail || err.error.message || err.error}` : String(err);
-        console.error('DataChannel error:', detail, err);
         this.handleChannelClosed(`channel error: ${detail}`);
       };
 
       this.pc.oniceconnectionstatechange = () => {
-        console.log('ICE connection state:', this.pc.iceConnectionState);
         if (this.pc.iceConnectionState === 'failed' || this.pc.iceConnectionState === 'disconnected') {
           this.handleChannelClosed(`ICE connection ${this.pc.iceConnectionState}`);
         }
       };
-      this.pc.onconnectionstatechange = () => {
-        console.log('Peer connection state:', this.pc.connectionState);
-      };
     }
 
     handleChannelClosed(reason) {
-      console.warn('P2P connection lost. Reason:', reason || '(unknown)');
       if (el.dzSub) el.dzSub.textContent = `P2P Connection lost with ${this.peerName}`;
       if (this.activeSend) {
         updateTransferRow(this.activeSend.transferId, {
@@ -514,8 +538,7 @@
     enqueueBatch(files) {
       const oversized = files.filter(f => f.size > MAX_FILE_SIZE);
       if (oversized.length > 0) {
-        const names = oversized.map(f => f.name).join(', ');
-        pushToast({ text: `File(s) exceed the 5 GB maximum limit: ${names}` });
+        pushToast({ text: `File(s) exceed the 10 GB limit.` });
       }
 
       const validFiles = files.filter(f => f.size <= MAX_FILE_SIZE);
@@ -525,8 +548,6 @@
       const jobs = validFiles.map(file => ({ transferId: uid(), batchId, file, offset: 0 }));
       this.sendQueue.push(...jobs);
 
-      const isChannelOpen = this.channel && this.channel.readyState === 'open';
-
       jobs.forEach(job => {
         addTransferRow({
           id: job.transferId,
@@ -534,24 +555,33 @@
           name: job.file.name,
           size: job.file.size,
           peerName: this.peerName,
-          status: isChannelOpen ? 'Sending…' : 'Connecting P2P channel…',
+          status: 'Waiting for partner…',
         });
       });
 
-      if (isChannelOpen) {
-        this.pumpSendQueue();
-      }
+      this.pumpSendQueue();
     }
 
     pumpSendQueue() {
       if (this.activeSend || this.sendQueue.length === 0) return;
       if (!this.channel || this.channel.readyState !== 'open') return;
       const next = this.sendQueue.shift();
-      this.startSend(next);
+      this.activeSend = next;
+
+      // Send offer to the recipient to prompt file save
+      this.send(JSON.stringify({
+        kind: 'file-offer',
+        transferId: next.transferId,
+        name: next.file.name,
+        size: next.file.size,
+        type: next.file.type,
+      }));
     }
 
-    async startSend(job) {
-      this.activeSend = job;
+    async startActiveSend() {
+      const job = this.activeSend;
+      if (!job) return;
+
       job.startTime = performance.now();
       job.lastTick = job.startTime;
       job.lastBytes = 0;
@@ -634,7 +664,7 @@
           }
         }
       } catch (err) {
-        console.error('File send error:', err);
+        console.error('Send error:', err);
         updateTransferRow(job.transferId, { status: 'Transfer error', statusClass: 'status-error' });
         this.activeSend = null;
       } finally {
@@ -648,125 +678,86 @@
       }
     }
 
+    acceptIncomingOffer(offer, receiveMode, fileHandle, writableStream) {
+      this.incoming = {
+        transferId: offer.transferId,
+        name: offer.name,
+        size: offer.size,
+        type: offer.type || 'application/octet-stream',
+        received: 0,
+        chunkIndex: 0,
+        receiveMode,
+        fileHandle,
+        writableStream,
+        lastTick: performance.now(),
+        lastBytes: 0,
+      };
+
+      addTransferRow({
+        id: offer.transferId,
+        dir: 'down',
+        name: offer.name,
+        size: offer.size,
+        peerName: this.peerName,
+        status: receiveMode === 'disk' ? 'Streaming to Disk…' : 'Receiving…',
+      });
+
+      this.send(JSON.stringify({ kind: 'file-accepted', transferId: offer.transferId }));
+    }
+
+    declineIncomingOffer(transferId) {
+      this.send(JSON.stringify({ kind: 'file-declined', transferId }));
+    }
+
     async handleMessage(data) {
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
-        if (msg.kind === 'file-start') {
-          if (msg.size > MAX_FILE_SIZE) {
-            pushToast({ text: `Rejected incoming file "${msg.name}": exceeds 5 GB limit.` });
-            this.incoming = null;
-            addTransferRow({
-              id: msg.transferId,
-              dir: 'down',
-              name: msg.name,
-              size: msg.size,
-              peerName: this.peerName,
-              status: 'Exceeds 5 GB limit',
-            });
-            updateTransferRow(msg.transferId, { statusClass: 'status-error' });
-            return;
-          }
 
-          this.incoming = {
-            transferId: msg.transferId,
-            name: msg.name,
-            size: msg.size,
-            type: msg.type || 'application/octet-stream',
-            received: 0,
-            chunkIndex: 0,
-            receiveMode: null,  
-            memoryChunks: null,  
-            fileHandle: null,
-            writableStream: null,
-            lastTick: performance.now(),
-            lastBytes: 0,
-          };
+        if (msg.kind === 'file-offer') {
+          state.pendingIncomingOffer = msg;
+          el.incomingSenderName.textContent = this.peerName;
+          el.incomingFileName.textContent = msg.name;
+          el.incomingFileSize.textContent = fmtBytes(msg.size);
+          el.incomingModalBackdrop.hidden = false;
+          return;
+        }
 
-          addTransferRow({
-            id: msg.transferId,
-            dir: 'down',
-            name: msg.name,
-            size: msg.size,
-            peerName: this.peerName,
-            status: 'Receiving…',
-          });
+        if (msg.kind === 'file-accepted' && this.activeSend?.transferId === msg.transferId) {
+          this.startActiveSend();
+          return;
+        }
 
-          if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
-            try {
-              const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
-              this.incoming.fileHandle = handle;
-              this.incoming.writableStream = await handle.createWritable();
-              this.incoming.receiveMode = 'disk';
-            } catch (err) {
-              console.warn('Disk stream picker skipped/cancelled/unsupported, falling back.', err);
-            }
-          }
+        if (msg.kind === 'file-declined' && this.activeSend?.transferId === msg.transferId) {
+          updateTransferRow(msg.transferId, { status: 'Declined by peer', statusClass: 'status-error' });
+          this.activeSend = null;
+          this.pumpSendQueue();
+          return;
+        }
 
-          if (!this.incoming.receiveMode) {
-            if (HAS_INDEXEDDB) {
-              this.incoming.receiveMode = 'indexeddb';
-              try { await ChunkStore.clearTransfer(msg.transferId); } catch (_) {}
-            } else {
-              this.incoming.receiveMode = 'memory';
-              this.incoming.memoryChunks = [];
-              if (msg.size > 500 * 1024 * 1024) {
-                pushToast({
-                  text: `"${msg.name}" is large (${fmtBytes(msg.size)}) and this browser doesn't support disk streaming or IndexedDB, so it will be held in memory. This is more likely to crash the tab.`,
-                });
-              }
-            }
-          }
-
-        } else if (msg.kind === 'file-end' && this.incoming) {
+        if (msg.kind === 'file-end' && this.incoming) {
           const job = this.incoming;
-          let downloadUrl = null;
 
           if (job.receiveMode === 'disk') {
             await job.writableStream.close();
             updateTransferRow(job.transferId, {
-              status: 'Saved to Disk',
+              status: 'Saved to Disk ✓',
               statusClass: 'status-done',
               progress: 1,
               metaText: fmtBytes(job.size),
             });
-          } else if (job.receiveMode === 'indexeddb') {
+            pushToast({ text: `Successfully saved "${job.name}" directly to disk!` });
+          } else {
+            // Mobile or Fallback streaming
             try {
               if (job.writeQueue) await job.writeQueue;
-              if (job.writeFailed) {
-                throw new Error('One or more chunks failed to write to IndexedDB');
-              }
-
-              // Detect if client is running on mobile
-              const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-
               let swAvailable = false;
-              if (isMobile) {
-                try {
-                  await swReady;
-                  swAvailable = !!navigator.serviceWorker.controller;
-                } catch (_) {
-                  swAvailable = false;
-                }
-              }
+              try {
+                await swReady;
+                swAvailable = !!navigator.serviceWorker.controller;
+              } catch (_) {}
 
-              // Desktop PC/Mac or non-SW Mobile: Use direct assembleBlob
-              // This guarantees Desktop Chrome downloads will NEVER hit "File wasn't available on site"
-              if (!isMobile || !swAvailable) {
-                const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
-                downloadUrl = URL.createObjectURL(blob);
-                ChunkStore.clearTransfer(job.transferId).catch(() => {});
-
-                updateTransferRow(job.transferId, {
-                  status: 'Received',
-                  statusClass: 'status-done',
-                  progress: 1,
-                  metaText: fmtBytes(job.size),
-                  downloadUrl: downloadUrl,
-                  downloadName: job.name,
-                });
-              } else {
-                // Mobile Streaming path
-                downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
+              if (swAvailable) {
+                const downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
                   + `?name=${encodeURIComponent(job.name)}`
                   + `&type=${encodeURIComponent(job.type)}`
                   + `&size=${encodeURIComponent(job.size)}`;
@@ -781,31 +772,23 @@
                   streamingDownload: true,
                   transferIdForCleanup: job.transferId,
                 });
+              } else {
+                const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
+                const downloadUrl = URL.createObjectURL(blob);
+                ChunkStore.clearTransfer(job.transferId).catch(() => {});
+
+                updateTransferRow(job.transferId, {
+                  status: 'Received',
+                  statusClass: 'status-done',
+                  progress: 1,
+                  metaText: fmtBytes(job.size),
+                  downloadUrl: downloadUrl,
+                  downloadName: job.name,
+                });
               }
             } catch (err) {
-              console.error('Failed to finalize received file from IndexedDB:', err);
-              pushToast({ text: `Failed to finalize "${job.name}" after receiving. Please try again.` });
+              console.error('Finalize error:', err);
               updateTransferRow(job.transferId, { status: 'Assembly failed', statusClass: 'status-error' });
-              ChunkStore.clearTransfer(job.transferId).catch(() => {});
-            }
-          } else if (job.receiveMode === 'memory' && job.memoryChunks) {
-            try {
-              const blob = new Blob(job.memoryChunks, { type: job.type });
-              job.memoryChunks = null;
-              downloadUrl = URL.createObjectURL(blob);
-
-              updateTransferRow(job.transferId, {
-                status: 'Received',
-                statusClass: 'status-done',
-                progress: 1,
-                metaText: fmtBytes(job.size),
-                downloadUrl: downloadUrl,
-                downloadName: job.name,
-              });
-            } catch (err) {
-              console.error('Failed to assemble received file:', err);
-              pushToast({ text: `Ran out of memory assembling "${job.name}".` });
-              updateTransferRow(job.transferId, { status: 'Out of memory', statusClass: 'status-error' });
             }
           }
 
@@ -816,17 +799,12 @@
 
         if (job.receiveMode === 'disk') {
           job.writableStream.write(data);
-        } else if (job.receiveMode === 'indexeddb') {
+        } else {
           const index = job.chunkIndex++;
-          const dataCopy = new Uint8Array(data); 
+          const dataCopy = new Uint8Array(data);
           job.writeQueue = (job.writeQueue || Promise.resolve()).then(
             () => ChunkStore.putChunk(job.transferId, index, dataCopy)
-          ).catch((err) => {
-            console.error('Failed to write chunk to IndexedDB:', err);
-            job.writeFailed = true;
-          });
-        } else if (job.receiveMode === 'memory' && job.memoryChunks) {
-          job.memoryChunks.push(new Uint8Array(data));
+          );
         }
 
         job.received += data.byteLength;
@@ -907,8 +885,6 @@
         doneBtn.setAttribute('aria-disabled', 'true');
         actions.appendChild(doneBtn);
       }
-      const state = card._downloadState || (card._downloadState = {});
-      state.consumed = true;
     }
 
     if (patch.downloadUrl) {
@@ -923,25 +899,17 @@
 
       if (patch.streamingDownload) {
         saveBtn.addEventListener('click', async (clickEvent) => {
-          if (card._downloadState && card._downloadState.consumed) {
-            clickEvent.preventDefault();
-            pushToast({ text: `You've already downloaded "${patch.downloadName}" — no need to save it again.` });
-            return;
-          }
           const exists = await ChunkStore.hasTransfer(patch.transferIdForCleanup).catch(() => true);
           if (!exists) {
             clickEvent.preventDefault();
-            pushToast({ text: `"${patch.downloadName}" is no longer available to download. Ask the sender to send it again if you need a copy.` });
+            pushToast({ text: `File expired. Ask sender to re-send.` });
           }
         });
       } else {
         saveBtn.target = '_blank';
         saveBtn.rel = 'noopener noreferrer';
-
         saveBtn.addEventListener('click', () => {
-          setTimeout(() => {
-            URL.revokeObjectURL(patch.downloadUrl);
-          }, 3 * 60 * 1000); 
+          setTimeout(() => URL.revokeObjectURL(patch.downloadUrl), 3 * 60 * 1000); 
         });
       }
 

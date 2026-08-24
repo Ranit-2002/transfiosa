@@ -88,17 +88,8 @@ self.addEventListener('fetch', (event) => {
       'Cache-Control': 'no-store, no-cache, must-revalidate',
     });
 
-    if (size) {
-      headers.set('Content-Length', size);
-    }
+    if (size) headers.set('Content-Length', size);
 
-    let status = 200;
-    if (event.request.headers.has('range') && size) {
-      status = 206; 
-      headers.set('Content-Range', `bytes 0-${size - 1}/${size}`);
-      headers.set('Accept-Ranges', 'bytes');
-    }
-
-    return new Response(stream, { status, headers });
+    return new Response(stream, { status: 200, headers });
   })());
 });
