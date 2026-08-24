@@ -100,6 +100,20 @@
         cursorReq.onerror = () => reject(cursorReq.error);
       });
     },
+
+    // Cheap existence check: stops at the first matching record instead of
+    // walking every chunk, since the caller only needs a yes/no.
+    async hasTransfer(transferId) {
+      const db = await this._openDb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('chunks', 'readonly');
+        const store = tx.objectStore('chunks');
+        const range = IDBKeyRange.bound([transferId, 0], [transferId, Infinity]);
+        const cursorReq = store.openCursor(range);
+        cursorReq.onsuccess = (e) => resolve(!!e.target.result);
+        cursorReq.onerror = () => reject(cursorReq.error);
+      });
+    },
   };
 
   const HAS_INDEXEDDB = typeof indexedDB !== 'undefined';
@@ -122,6 +136,19 @@
       })
     : Promise.reject(new Error('Service workers not supported in this browser'));
   swReady.catch(() => {}); // prevent an unhandled rejection warning; callers check this themselves
+
+  // Fires once the service worker has confirmed it read every chunk for a
+  // transfer out of IndexedDB and closed the response stream successfully —
+  // i.e. the download genuinely completed, not just "some time has passed
+  // since a click." This is what cleanup should be conditioned on.
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg && msg.type === 'beam-download-complete' && msg.transferId) {
+        ChunkStore.clearTransfer(msg.transferId).catch(() => {});
+      }
+    });
+  }
 
   // ---------- Application State ----------
   const state = {
@@ -454,14 +481,36 @@
 
       this.channel.onmessage = (e) => this.handleMessage(e.data);
       this.channel.onbufferedamountlow = () => this.pumpActiveSend();
-      this.channel.onclose = () => this.handleChannelClosed();
+      this.channel.onclose = () => this.handleChannelClosed('channel closed');
       this.channel.onerror = (err) => {
-        console.error('DataChannel error:', err);
-        this.handleChannelClosed();
+        // RTCErrorEvent carries a structured .error with more detail than a
+        // generic 'error' — surface it if present so the real cause (e.g.
+        // ICE failure, SCTP failure, DTLS failure) is visible instead of a
+        // single undifferentiated message covering every possible cause.
+        const detail = err?.error ? `${err.error.errorDetail || err.error.message || err.error}` : String(err);
+        console.error('DataChannel error:', detail, err);
+        this.handleChannelClosed(`channel error: ${detail}`);
+      };
+
+      // Connection-level (not just data-channel-level) state changes. On a
+      // direction-dependent failure like "works A→B, fails B→A", the ICE
+      // connection state at the moment of failure is the single most useful
+      // piece of information for narrowing down whether this is NAT
+      // traversal, a firewall difference between the two devices, or
+      // something else — and it's currently not logged anywhere.
+      this.pc.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', this.pc.iceConnectionState);
+        if (this.pc.iceConnectionState === 'failed' || this.pc.iceConnectionState === 'disconnected') {
+          this.handleChannelClosed(`ICE connection ${this.pc.iceConnectionState}`);
+        }
+      };
+      this.pc.onconnectionstatechange = () => {
+        console.log('Peer connection state:', this.pc.connectionState);
       };
     }
 
-    handleChannelClosed() {
+    handleChannelClosed(reason) {
+      console.warn('P2P connection lost. Reason:', reason || '(unknown)');
       if (el.dzSub) el.dzSub.textContent = `P2P Connection lost with ${this.peerName}`;
       if (this.activeSend) {
         updateTransferRow(this.activeSend.transferId, {
@@ -938,18 +987,30 @@
       if (patch.streamingDownload) {
         // Streaming download (service-worker route): this is a same-origin
         // request the browser handles as a normal download, so it does not
-        // need target="_blank" or object-URL revocation. Clean up the
-        // IndexedDB chunk store once the browser has finished fetching —
-        // detected via a message the service worker could post back, but
-        // since that round-trip adds complexity for uncertain benefit here,
-        // a generous fixed delay after the click is used instead. This
-        // matches the spirit of the original 3-minute safety delay used for
-        // the object-URL case below, and errs toward keeping the data
-        // available rather than deleting it too early.
-        saveBtn.addEventListener('click', () => {
-          setTimeout(() => {
-            ChunkStore.clearTransfer(patch.transferIdForCleanup).catch(() => {});
-          }, 3 * 60 * 1000);
+        // need target="_blank" or object-URL revocation. IndexedDB cleanup
+        // for this transfer happens in the 'beam-download-complete' listener
+        // registered once at startup (see below) — triggered by the service
+        // worker confirming it actually finished reading every chunk, not by
+        // a fixed delay after the click. A timer here had no way to know
+        // whether the download had really finished, so a retry or a second
+        // click after the timer elapsed could hit already-deleted chunks —
+        // which is what produced Chrome's generic "file wasn't available on
+        // site" error for a transfer that had genuinely succeeded moments
+        // earlier.
+        //
+        // This still leaves one legitimate case: the chunks really are gone
+        // (cleared after a prior successful download, or lost to browser
+        // storage pressure). Checking first and giving a clear in-app
+        // message beats letting that surface as the same generic
+        // browser-level download error that caused the original confusion.
+        saveBtn.addEventListener('click', async (clickEvent) => {
+          const exists = await ChunkStore.hasTransfer(patch.transferIdForCleanup).catch(() => true);
+          // On a check failure, default to letting the download attempt
+          // proceed rather than blocking a possibly-fine download.
+          if (!exists) {
+            clickEvent.preventDefault();
+            pushToast({ text: `"${patch.downloadName}" is no longer available to download — it was already saved and cleared. Ask the sender to send it again if you need another copy.` });
+          }
         });
       } else {
         // Object-URL case (fallback path, or the small-file / disk-stream

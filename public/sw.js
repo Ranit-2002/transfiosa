@@ -82,29 +82,54 @@ self.addEventListener('fetch', (event) => {
       return new Response('Failed to open storage: ' + err.message, { status: 500 });
     }
 
+    let bytesEnqueued = 0;
+
     const stream = new ReadableStream({
       async start(controller) {
         try {
           let sawAnyChunk = false;
           await forEachChunkInOrder(db, transferId, (data) => {
             sawAnyChunk = true;
-            // data is a Uint8Array as stored by putChunk in app.js
+            bytesEnqueued += data.byteLength;
             controller.enqueue(data);
           });
+
           if (!sawAnyChunk) {
-            controller.error(new Error('No chunks found for this transfer — it may have already been cleared or never existed.'));
+            // The chunks are gone. Distinguish this from a transient failure
+            // in the response body so the page can tell the user plainly
+            // "this needs re-sending" instead of a bare network-style error.
+            // (Previously chunks were deleted on a fixed 3-minute timer after
+            // the first click, with no confirmation the download had actually
+            // finished — a second click or retry after that window silently
+            // hit this exact case. Cleanup now happens only after a
+            // confirmed full read, via the 'beam-download-complete' message
+            // below, so a legitimate re-download attempt won't be defeated
+            // by a stale timer.)
+            controller.error(new Error('EXPIRED_OR_MISSING'));
             return;
           }
+
           controller.close();
+
+          // Tell every controlled page that this transfer was fully read out
+          // of storage, so app.js can clear it now — based on a confirmed
+          // successful read, not a guess about how long that should take.
+          // includeUncontrolled: true matters here specifically — on a cold
+          // load right after this service worker first registers/activates,
+          // the page that issued this very fetch might not yet count as a
+          // "controlled" client in the strict sense, and would otherwise be
+          // silently excluded from this list, never receiving the completion
+          // message the app depends on for cleanup timing.
+          const clients = await self.clients.matchAll({ includeUncontrolled: true });
+          for (const client of clients) {
+            client.postMessage({ type: 'beam-download-complete', transferId, bytesEnqueued });
+          }
         } catch (err) {
           controller.error(err);
         }
       },
     });
 
-    // Content-Disposition with a filename triggers a real download (saved to
-    // the device's Downloads/Files area) rather than an in-page navigation,
-    // on every browser tested here.
     const headers = new Headers({
       'Content-Type': mimeType,
       'Content-Disposition': `attachment; filename="${filename.replace(/"/g, '')}"`,
