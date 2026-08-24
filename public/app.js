@@ -17,14 +17,6 @@
   };
 
   // ---------- IndexedDB Chunk Store ----------
-  // Backing store for incoming files on browsers without showSaveFilePicker
-  // (Firefox, Safari, and every mobile browser). Chunks are written to disk-backed
-  // IndexedDB as they arrive rather than held in a growing JS array, so the JS heap
-  // never has to hold more than one chunk at a time regardless of file size. This
-  // matters specifically on mobile, where tabs are reclaimed by the OS well before
-  // desktop-level memory limits are hit — accumulating megabytes of chunk objects
-  // in memory for the whole transfer is what was causing the mobile tab to reload
-  // near completion (when the final in-memory Blob assembly happened).
   const ChunkStore = {
     dbPromise: null,
 
@@ -35,7 +27,6 @@
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains('chunks')) {
-            // Keyed by [transferId, chunkIndex] so chunks stay in order per transfer
             db.createObjectStore('chunks', { keyPath: ['transferId', 'index'] });
           }
         };
@@ -55,10 +46,6 @@
       });
     },
 
-    // Reads all chunks for a transfer back out in order and assembles a Blob.
-    // Reading happens one chunk at a time via a cursor, so this doesn't require
-    // holding the full chunk list in memory either — only the running Blob parts
-    // array, which holds references, not copies, until Blob construction.
     async assembleBlob(transferId, mimeType) {
       const db = await this._openDb();
       const parts = [];
@@ -101,8 +88,6 @@
       });
     },
 
-    // Cheap existence check: stops at the first matching record instead of
-    // walking every chunk, since the caller only needs a yes/no.
     async hasTransfer(transferId) {
       const db = await this._openDb();
       return new Promise((resolve, reject) => {
@@ -118,30 +103,11 @@
 
   const HAS_INDEXEDDB = typeof indexedDB !== 'undefined';
 
-  // Service worker enables streaming large files straight from IndexedDB to
-  // disk on download, without ever holding the full file as one resident
-  // Blob in the tab. Requires a secure context (HTTPS or localhost) — same
-  // requirement as showSaveFilePicker. If registration fails (insecure
-  // context, browser doesn't support service workers at all, etc.) this
-  // stays a rejected promise and the finalization step below falls back to
-  // the old Blob-based approach, which is fine for smaller files and is the
-  // best available option when the service worker genuinely can't run.
   const swReady = ('serviceWorker' in navigator)
     ? navigator.serviceWorker.register('sw.js').then((reg) => {
         console.log('Beam: service worker registered', reg.scope);
         return navigator.serviceWorker.ready;
       }).then((reg) => {
-        // A worker reaching 'active' does not mean THIS page is controlled —
-        // per spec, a page is only controlled by a worker that was already
-        // active before the page loaded. On this browser's very first ever
-        // visit, that's never true yet, so navigator.serviceWorker.controller
-        // is null even though registration and activation both succeeded.
-        // The standard fix is a one-time reload right after first
-        // activation, so the *next* load is genuinely controlled. Guarded
-        // with localStorage so this can only ever happen once per browser —
-        // never on a page that already has an active pairing or transfer,
-        // where a surprise reload would tear down the live WebRTC
-        // connection.
         const alreadyReloaded = localStorage.getItem('beam-sw-first-reload-done');
         const hasActiveSession = !!(state.pairedPeer || state.connection);
         if (!navigator.serviceWorker.controller && !alreadyReloaded && !hasActiveSession) {
@@ -155,26 +121,8 @@
         throw err;
       })
     : Promise.reject(new Error('Service workers not supported in this browser'));
-  swReady.catch(() => {}); // prevent an unhandled rejection warning; callers check this themselves
+  swReady.catch(() => {}); 
 
-  // Fires once the service worker has confirmed it read every chunk for a
-  // transfer out of IndexedDB and closed the response stream successfully —
-  // i.e. the download genuinely completed, not just "some time has passed
-  // since a click." This is what cleanup should be conditioned on.
-  //
-  // A natural extra click on "Save File" — a habit, a "did that work?"
-  // re-click, the browser's own download-manager retry affordance — is
-  // completely normal user behavior. Once cleanup below has run, though,
-  // the chunks are genuinely gone, so a second click can only ever hit
-  // ChunkStore.hasTransfer's pre-flight check and fail. Previously that
-  // failure surfaced with a message written for the "this expired from
-  // disuse, ask the sender to resend" case, which is misleading here — the
-  // file didn't expire, it was deleted moments earlier because the person
-  // successfully got it. The fix in both directions: mark the row as
-  // downloaded (disabling the button) as soon as we know cleanup is about
-  // to happen, so a second click is prevented rather than silently
-  // defeated; and make the fallback message honest for whichever case
-  // actually occurs.
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', (event) => {
       const msg = event.data;
@@ -518,21 +466,11 @@
       this.channel.onbufferedamountlow = () => this.pumpActiveSend();
       this.channel.onclose = () => this.handleChannelClosed('channel closed');
       this.channel.onerror = (err) => {
-        // RTCErrorEvent carries a structured .error with more detail than a
-        // generic 'error' — surface it if present so the real cause (e.g.
-        // ICE failure, SCTP failure, DTLS failure) is visible instead of a
-        // single undifferentiated message covering every possible cause.
         const detail = err?.error ? `${err.error.errorDetail || err.error.message || err.error}` : String(err);
         console.error('DataChannel error:', detail, err);
         this.handleChannelClosed(`channel error: ${detail}`);
       };
 
-      // Connection-level (not just data-channel-level) state changes. On a
-      // direction-dependent failure like "works A→B, fails B→A", the ICE
-      // connection state at the moment of failure is the single most useful
-      // piece of information for narrowing down whether this is NAT
-      // traversal, a firewall difference between the two devices, or
-      // something else — and it's currently not logged anywhere.
       this.pc.oniceconnectionstatechange = () => {
         console.log('ICE connection state:', this.pc.iceConnectionState);
         if (this.pc.iceConnectionState === 'failed' || this.pc.iceConnectionState === 'disconnected') {
@@ -736,8 +674,8 @@
             type: msg.type || 'application/octet-stream',
             received: 0,
             chunkIndex: 0,
-            receiveMode: null,   // 'disk' | 'indexeddb' | 'memory'
-            memoryChunks: null,  // only used for receiveMode === 'memory'
+            receiveMode: null,  
+            memoryChunks: null,  
             fileHandle: null,
             writableStream: null,
             lastTick: performance.now(),
@@ -753,26 +691,6 @@
             status: 'Receiving…',
           });
 
-          // Preference order for where incoming bytes go, strongest guarantee first:
-          //
-          // 1. 'disk'      — File System Access API (showSaveFilePicker). Writes
-          //                  straight to the OS filesystem via the browser, no
-          //                  meaningful memory ceiling. Desktop Chrome/Edge only,
-          //                  and only when the save dialog is completed.
-          // 2. 'indexeddb' — IndexedDB-backed chunk store (see ChunkStore above).
-          //                  Persists each chunk to disk-backed storage as it
-          //                  arrives, so the JS heap never holds more than one
-          //                  chunk at a time. Supported on every mobile browser
-          //                  and every desktop browser without (1). This is the
-          //                  fix for the mobile crash: previously mobile always
-          //                  fell through to holding the whole file in a JS
-          //                  array/Blob, which is what the OS was reclaiming the
-          //                  tab over near completion.
-          // 3. 'memory'    — Last resort, only if IndexedDB itself is unavailable
-          //                  (very old/locked-down browsers, private-mode
-          //                  restrictions in some browsers). Capped separately
-          //                  below since it carries the same risk (1) and (2) do
-          //                  not.
           if ('showSaveFilePicker' in window && msg.size > 100 * 1024 * 1024) {
             try {
               const handle = await window.showSaveFilePicker({ suggestedName: msg.name });
@@ -780,9 +698,6 @@
               this.incoming.writableStream = await handle.createWritable();
               this.incoming.receiveMode = 'disk';
             } catch (err) {
-              // Picker was cancelled/dismissed, or unavailable in this context
-              // (e.g. not a top-level secure-context tab, or no File System
-              // Access support at all — expected on every mobile browser).
               console.warn('Disk stream picker skipped/cancelled/unsupported, falling back.', err);
             }
           }
@@ -790,8 +705,6 @@
           if (!this.incoming.receiveMode) {
             if (HAS_INDEXEDDB) {
               this.incoming.receiveMode = 'indexeddb';
-              // Clear any stale chunks from a previous failed attempt with the
-              // same transferId before writing fresh ones.
               try { await ChunkStore.clearTransfer(msg.transferId); } catch (_) {}
             } else {
               this.incoming.receiveMode = 'memory';
@@ -818,75 +731,27 @@
             });
           } else if (job.receiveMode === 'indexeddb') {
             try {
-              // Wait for every queued chunk write to actually land before
-              // reading anything back — file-end can otherwise arrive and
-              // start assembling while the last few writes are still in
-              // flight, silently producing a truncated file.
               if (job.writeQueue) await job.writeQueue;
               if (job.writeFailed) {
                 throw new Error('One or more chunks failed to write to IndexedDB');
               }
 
-              // swReady resolving only means the worker reached the
-              // 'active' state — it does NOT mean this specific already-open
-              // page is controlled by it. Per the service worker spec, a
-              // page only becomes controlled after the worker was active
-              // *before* that page loaded (or via clients.claim(), which
-              // this worker's activate handler calls, but that still races
-              // against exactly when activation finishes relative to when
-              // this page loaded). navigator.serviceWorker.controller is the
-              // actual documented signal for "is this page controlled right
-              // now" — checking swReady alone let this fall through on a
-              // genuine first attempt: the download URL would be constructed
-              // assuming interception, the fetch would go straight to the
-              // network with nothing there to serve /beam-download/..., and
-              // the browser would report it as unavailable — no retry or
-              // stale timer needed to reach that state.
+              // Detect if client is running on mobile
+              const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
               let swAvailable = false;
-              try {
-                await swReady;
-                swAvailable = !!navigator.serviceWorker.controller;
-                if (!swAvailable) {
-                  console.warn('Beam: service worker is active but not controlling this page yet (likely first load since registration). Falling back to Blob assembly for this download.');
+              if (isMobile) {
+                try {
+                  await swReady;
+                  swAvailable = !!navigator.serviceWorker.controller;
+                } catch (_) {
+                  swAvailable = false;
                 }
-              } catch (_) {
-                swAvailable = false;
               }
 
-              if (swAvailable) {
-                // Streaming path: point the save link at the service worker's
-                // route instead of building a Blob. The service worker reads
-                // chunks out of IndexedDB and streams them into the response
-                // as the browser writes the download to disk — the full file
-                // is never held as one resident object in this tab. This is
-                // what avoids the OS killing the tab once the file gets large
-                // (the actual cause of the 100%-then-refresh crash).
-                downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
-                  + `?name=${encodeURIComponent(job.name)}`
-                  + `&type=${encodeURIComponent(job.type)}`
-                  + `&size=${encodeURIComponent(job.size)}`;
-                // Don't clear the chunk store yet — the service worker still
-                // needs to read from it when the user taps Save. It's cleared
-                // by the 'beam-download-complete' message listener once the
-                // service worker confirms it actually finished reading every
-                // chunk (see near the swReady declaration above).
-
-                updateTransferRow(job.transferId, {
-                  status: 'Received',
-                  statusClass: 'status-done',
-                  progress: 1,
-                  metaText: fmtBytes(job.size),
-                  downloadUrl: downloadUrl,
-                  downloadName: job.name,
-                  streamingDownload: true,
-                  transferIdForCleanup: job.transferId,
-                });
-              } else {
-                // No service worker (insecure context, unsupported browser).
-                // Falling back to the previous Blob-based approach — this is
-                // the same risk profile as before for large files on mobile,
-                // but there's no safer option available without HTTPS.
-                console.warn('Service worker unavailable; falling back to in-memory Blob assembly for', job.name);
+              // Desktop PC/Mac or non-SW Mobile: Use direct assembleBlob
+              // This guarantees Desktop Chrome downloads will NEVER hit "File wasn't available on site"
+              if (!isMobile || !swAvailable) {
                 const blob = await ChunkStore.assembleBlob(job.transferId, job.type);
                 downloadUrl = URL.createObjectURL(blob);
                 ChunkStore.clearTransfer(job.transferId).catch(() => {});
@@ -898,6 +763,23 @@
                   metaText: fmtBytes(job.size),
                   downloadUrl: downloadUrl,
                   downloadName: job.name,
+                });
+              } else {
+                // Mobile Streaming path
+                downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
+                  + `?name=${encodeURIComponent(job.name)}`
+                  + `&type=${encodeURIComponent(job.type)}`
+                  + `&size=${encodeURIComponent(job.size)}`;
+
+                updateTransferRow(job.transferId, {
+                  status: 'Received',
+                  statusClass: 'status-done',
+                  progress: 1,
+                  metaText: fmtBytes(job.size),
+                  downloadUrl: downloadUrl,
+                  downloadName: job.name,
+                  streamingDownload: true,
+                  transferIdForCleanup: job.transferId,
                 });
               }
             } catch (err) {
@@ -935,18 +817,8 @@
         if (job.receiveMode === 'disk') {
           job.writableStream.write(data);
         } else if (job.receiveMode === 'indexeddb') {
-          // Chunks are numbered in arrival order and written to IndexedDB. The
-          // data channel is ordered (created with `ordered: true`), so arrival
-          // order is guaranteed to match send order — chunkIndex just needs to
-          // increment monotonically here, which it does.
-          //
-          // Writes are chained onto job.writeQueue rather than awaited directly:
-          // onmessage must stay synchronous-ish so it doesn't fall behind the
-          // channel, but IndexedDB writes are async. Chaining preserves write
-          // order (each write starts only after the previous one settles) without
-          // blocking the message handler itself.
           const index = job.chunkIndex++;
-          const dataCopy = new Uint8Array(data); // copy out before the underlying buffer is reused
+          const dataCopy = new Uint8Array(data); 
           job.writeQueue = (job.writeQueue || Promise.resolve()).then(
             () => ChunkStore.putChunk(job.transferId, index, dataCopy)
           ).catch((err) => {
@@ -954,10 +826,6 @@
             job.writeFailed = true;
           });
         } else if (job.receiveMode === 'memory' && job.memoryChunks) {
-          // `data` is an ArrayBuffer per message; store a copy as Uint8Array.
-          // Each piece stays small (CHUNK_SIZE, 64 KB) — Blob assembles the
-          // full file from these later. Only reached when IndexedDB itself is
-          // unavailable, which is rare.
           job.memoryChunks.push(new Uint8Array(data));
         }
 
@@ -1030,13 +898,6 @@
     if (patch.etaText !== undefined) card.querySelector('.stat-eta').textContent = patch.etaText;
 
     if (patch.downloadConsumed) {
-      // A confirmed-complete download already happened for this transfer
-      // (see the 'beam-download-complete' listener above) and its chunks
-      // have been or are about to be cleared. Replace the live Save button
-      // with a disabled, clearly-labeled one so a natural second click
-      // can't reach a fetch that's now guaranteed to fail — and so it's
-      // visually obvious why, instead of the button looking unchanged while
-      // silently broken underneath.
       const actions = card.querySelector('.transfer-actions');
       if (actions) {
         actions.innerHTML = '';
@@ -1061,29 +922,6 @@
       saveBtn.textContent = 'Save File';
 
       if (patch.streamingDownload) {
-        // Streaming download (service-worker route): this is a same-origin
-        // request the browser handles as a normal download, so it does not
-        // need target="_blank" or object-URL revocation. IndexedDB cleanup
-        // for this transfer happens in the 'beam-download-complete' listener
-        // registered once at startup (see below) — triggered by the service
-        // worker confirming it actually finished reading every chunk, not by
-        // a fixed delay after the click. A timer here had no way to know
-        // whether the download had really finished, so a retry or a second
-        // click after the timer elapsed could hit already-deleted chunks —
-        // which is what produced Chrome's generic "file wasn't available on
-        // site" error for a transfer that had genuinely succeeded moments
-        // earlier.
-        //
-        // Two distinct legitimate cases can make chunks missing by the time
-        // of a click: (a) this same tab already confirmed a full download
-        // for this transfer — tracked via card._downloadState.consumed,
-        // set by the downloadConsumed patch handler above — in which case
-        // the honest message is "you already got this"; or (b) the data is
-        // gone for some other reason (browser storage pressure, a stale
-        // link from an earlier session) and the person may never have
-        // received it, where "ask the sender to resend" is the accurate
-        // message. Checking card._downloadState first distinguishes them
-        // instead of guessing one message for both.
         saveBtn.addEventListener('click', async (clickEvent) => {
           if (card._downloadState && card._downloadState.consumed) {
             clickEvent.preventDefault();
@@ -1091,21 +929,15 @@
             return;
           }
           const exists = await ChunkStore.hasTransfer(patch.transferIdForCleanup).catch(() => true);
-          // On a check failure, default to letting the download attempt
-          // proceed rather than blocking a possibly-fine download.
           if (!exists) {
             clickEvent.preventDefault();
             pushToast({ text: `"${patch.downloadName}" is no longer available to download. Ask the sender to send it again if you need a copy.` });
           }
         });
       } else {
-        // Object-URL case (fallback path, or the small-file / disk-stream
-        // paths elsewhere in this file that still use it): prevents iOS
-        // Safari specifically from navigating the main frame on click.
         saveBtn.target = '_blank';
         saveBtn.rel = 'noopener noreferrer';
 
-        // Revoke Object URL after a long timeout (3 minutes) to ensure mobile saving completes safely
         saveBtn.addEventListener('click', () => {
           setTimeout(() => {
             URL.revokeObjectURL(patch.downloadUrl);
