@@ -863,7 +863,8 @@
                 // (the actual cause of the 100%-then-refresh crash).
                 downloadUrl = `/beam-download/${encodeURIComponent(job.transferId)}`
                   + `?name=${encodeURIComponent(job.name)}`
-                  + `&type=${encodeURIComponent(job.type)}`;
+                  + `&type=${encodeURIComponent(job.type)}`
+                  + `&size=${encodeURIComponent(job.size)}`;
                 // Don't clear the chunk store yet — the service worker still
                 // needs to read from it when the user taps Save. It's cleared
                 // by the 'beam-download-complete' message listener once the
